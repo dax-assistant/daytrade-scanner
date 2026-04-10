@@ -9,13 +9,13 @@ Momentum scanner and paper-trading simulator for small-cap trading setups.
 - [x] Add a Dockerfile and `.dockerignore`
 - [x] Add GitHub Actions to build and push `ghcr.io/<owner>/daytrade-scanner`
 - [x] Add Tower deployment files with persistent config, data, and logs
-- [x] Add a dedicated Watchtower sidecar scoped to this app
-- [ ] Create the GitHub repository
-- [ ] Push the standalone project to GitHub
-- [ ] Let GitHub Actions publish the first container image
-- [ ] Copy real config to Tower
-- [ ] Deploy the stack on Tower
-- [ ] Verify health and auto-update behavior
+- [x] Use Tower's global Watchtower to auto-update the scanner container
+- [x] Create the GitHub repository
+- [x] Push the standalone project to GitHub
+- [x] Let GitHub Actions publish the first container image
+- [x] Copy real config to Tower
+- [x] Deploy the stack on Tower
+- [x] Verify health and auto-update behavior
 
 ## Local development
 
@@ -44,6 +44,7 @@ Health endpoint:
 ## Tower deployment
 
 Files for Tower live under `deploy/tower/`.
+Full rollout notes live in `DEPLOY.md`.
 
 Expected layout on Tower:
 
@@ -67,7 +68,7 @@ docker-compose up -d
 
 1. Push to `main`
 2. GitHub Actions builds and publishes `ghcr.io/dax-assistant/daytrade-scanner:latest`
-3. Tower Watchtower detects the updated image
+3. Tower's global Watchtower detects the updated image
 4. Tower pulls and restarts the scanner container
 
 ## Config

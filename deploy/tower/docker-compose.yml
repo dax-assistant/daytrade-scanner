@@ -11,20 +11,3 @@ services:
       - ./logs:/app/logs
     labels:
       com.centurylinklabs.watchtower.enable: "true"
-      com.centurylinklabs.watchtower.scope: "daytrade-scanner"
-
-  daytrade-scanner-watchtower:
-    image: containrrr/watchtower:latest
-    container_name: daytrade-scanner-watchtower
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      REPO_USER: ${GHCR_USER}
-      REPO_PASS: ${GHCR_TOKEN}
-      WATCHTOWER_LABEL_ENABLE: "true"
-      WATCHTOWER_SCOPE: daytrade-scanner
-      WATCHTOWER_POLL_INTERVAL: "60"
-      WATCHTOWER_CLEANUP: "true"
-    labels:
-      com.centurylinklabs.watchtower.scope: "daytrade-scanner"
