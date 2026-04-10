@@ -1,0 +1,108 @@
+environment: paper
+timezone: America/New_York
+TELEGRAM_ENABLED: false
+api:
+  alpaca:
+    key_id: YOUR_ALPACA_KEY_ID
+    secret_key: YOUR_ALPACA_SECRET_KEY
+    data_base_url: https://data.alpaca.markets
+    trading_base_url: https://paper-api.alpaca.markets
+    feed: iex
+    websocket_url: wss://stream.data.alpaca.markets/v2/iex
+    request_timeout_seconds: 15
+  finnhub:
+    api_key: YOUR_FINNHUB_API_KEY
+    base_url: https://finnhub.io/api/v1
+    request_timeout_seconds: 15
+  telegram:
+    bot_token: YOUR_TELEGRAM_BOT_TOKEN
+    chat_id: '8474445926'
+    base_url: https://api.telegram.org
+    enabled: false
+scanner:
+  active_hours:
+    start_hour_et: 4
+    end_hour_et: 16
+    primary_window_start_hour_et: 7
+    primary_window_end_hour_et: 10
+  intervals_seconds:
+    premarket: 60
+    market_open: 30
+    late_day: 120
+    universe_refresh: 300
+  thresholds:
+    min_price: 2.0
+    max_price: 20.0
+    min_gap_percent: 10.0
+    min_relative_volume: 5.0
+    max_float_shares: 10000000
+    min_pillars_for_alert: 5
+    max_news_age_hours: 24
+    max_candidates_per_cycle: 300
+    prefilter_min_gap_percent: 5.0
+    prefilter_min_volume: 50000
+    min_avg_volume_floor: 1
+    relative_volume_lookback_days: 20
+    universe_scan_multiplier: 12
+  alert:
+    cooldown_minutes: 15
+    new_high_realert_percent: 2.0
+runtime:
+  websocket:
+    enabled: true
+    max_symbols: 30
+    reconnect_max_seconds: 60
+  rate_limits:
+    alpaca_calls_per_minute: 180
+    finnhub_calls_per_minute: 55
+  worker:
+    max_concurrent_symbol_checks: 10
+logging:
+  directory: /app/logs
+  scanner_hits_filename_pattern: scanner-hits-%Y-%m-%d.jsonl
+  alerts_filename_pattern: alerts-%Y-%m-%d.jsonl
+  app_log_filename_pattern: app-%Y-%m-%d.log
+  level: INFO
+web:
+  enabled: true
+  host: 0.0.0.0
+  port: 8081
+  cors_origins:
+    - '*'
+simulator:
+  enabled: true
+  default_risk_profile: moderate
+  account_size: 25000.0
+  max_positions: 3
+  max_daily_loss: 500.0
+  entry_delay_seconds: 5
+  use_alpaca_orders: true
+  eod_summary_telegram: true
+  weekly_report_telegram: true
+  monthly_report_telegram: true
+  simulated_slippage_bps: 10.0
+  reconcile_interval_seconds: 30
+risk_profiles:
+  conservative:
+    position_size_pct: 2.0
+    stop_loss_pct: 3.0
+    take_profit_pct: 5.0
+    trailing_stop: false
+    trailing_stop_pct: 0.0
+    max_hold_minutes: 30
+  moderate:
+    position_size_pct: 5.0
+    stop_loss_pct: 5.0
+    take_profit_pct: 10.0
+    trailing_stop: false
+    trailing_stop_pct: 0.0
+    max_hold_minutes: 60
+  aggressive:
+    position_size_pct: 10.0
+    stop_loss_pct: 7.0
+    take_profit_pct: 0.0
+    trailing_stop: true
+    trailing_stop_pct: 5.0
+    max_hold_minutes: 120
+database:
+  path: /app/data/scanner.db

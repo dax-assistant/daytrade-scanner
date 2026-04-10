@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Day Trade Scanner v3</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://unpkg.com/lightweight-charts@4/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <!-- ===== HEADER BAR ===== -->
+  <header class="header-bar">
+    <div class="header-left">
+      <h1>⚡ Scanner Dashboard v3</h1>
+      <span id="scannerState" class="pill pill-gray">connecting</span>
+      <span id="sessionBadge" class="pill pill-gray">CLOSED</span>
+      <span id="primaryCountdown" class="muted">Primary window: --</span>
+    </div>
+    <div class="header-center">
+      <nav class="view-tabs" role="tablist">
+        <button class="view-tab active" id="tabTrading" data-view="trading" role="tab" aria-selected="true" title="Press 1">Trading</button>
+        <button class="view-tab" id="tabChart" data-view="chart" role="tab" aria-selected="false" title="Press 2">Chart</button>
+        <button class="view-tab" id="tabAnalytics" data-view="analytics" role="tab" aria-selected="false" title="Press 3">Analytics</button>
+      </nav>
+    </div>
+    <div class="header-right">
+      <label class="toggle-row">
+        <input type="checkbox" id="telegramToggle" /> Telegram
+      </label>
+      <button id="settingsBtn" class="icon-btn">⚙️</button>
+    </div>
+  </header>
+
+  <!-- ===== SUMMARY BAR ===== -->
+  <section class="summary-bar">
+    <div>Daily P&amp;L <strong id="dailyPnl">$0.00</strong></div>
+    <div><strong id="alltimePnl" class="muted">All-Time: $0.00 (0 trades)</strong></div>
+    <div>Win Rate <strong id="winRate">0%</strong></div>
+    <div>Account <strong id="accountBalance">$0.00</strong></div>
+    <div>Open Positions <strong id="openCount">0</strong></div>
+    <div class="loss-meter-wrap">
+      Daily Loss <span id="lossUsage">$0 / $0</span>
+      <div class="loss-meter"><div id="lossMeterBar"></div></div>
+    </div>
+  </section>
+
+  <!-- ===================================================
+       VIEW 1: TRADING DASHBOARD
+  ==================================================== -->
+  <div id="view-trading" class="view-container layout-trading">
+    <aside class="left-sidebar trading-watchlist-col">
+      <div id="watchlistPanel" class="sidebar-section watchlist-section watchlist-panel">
+        <div class="panel-title">Watchlist</div>
+        <div id="watchlistLoading" class="muted">Loading watchlist...</div>
+        <div id="watchlistEmpty" class="empty-state hidden">No candidates yet — scanner active 7-10 AM ET</div>
+        <div id="watchlist" class="watchlist"></div>
+      </div>
+    </aside>
+
+    <section class="trading-main-col">
+      <div id="alertFeed" class="sidebar-section alerts-section alert-panel trading-alerts-panel">
+        <div class="panel-title">Alert Feed</div>
+        <ul id="alerts" class="alerts"></ul>
+      </div>
+
+      <div class="sidebar-section positions-section trading-positions-panel">
+        <div class="panel-title">Open Positions</div>
+        <div class="table-scroll">
+          <table class="positions-table">
+            <thead><tr><th>Ticker</th><th>Entry</th><th>Curr</th><th>Target</th><th>Qty</th><th>P&amp;L</th><th>Stop</th><th>Time</th><th>Hold</th></tr></thead>
+            <tbody id="positionsBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="history-area trading-history-panel">
+        <div class="history-header">
+          <h3>Trade History</h3>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>ID</th><th>Ticker</th><th>Entry</th><th>Exit</th><th>Target</th><th>P&amp;L</th><th>Status</th><th>Entry Time</th><th>Exit Time</th><th>📝</th></tr></thead>
+            <tbody id="historyBody"></tbody>
+          </table>
+        </div>
+        <div id="historyStats" class="muted history-stats"></div>
+      </div>
+    </section>
+
+    <div class="trading-footer">
+      <section class="glossary">
+        <button id="glossaryToggle" class="glossary-toggle">📖 How It Works &amp; Glossary ▼</button>
+        <div id="glossaryContent" class="glossary-content hidden">
+          <p id="howItWorks"></p>
+          <h4>5 Pillars (Live Thresholds)</h4>
+          <ul id="pillarsLive"></ul>
+          <h4>Glossary</h4>
+          <div id="glossaryDefs"></div>
+        </div>
+      </section>
+    </div>
+  </div><!-- /#view-trading -->
+
+
+  <!-- ===================================================
+       VIEW 2: CHART
+  ==================================================== -->
+  <div id="view-chart" class="view-container chart-view hidden">
+    <section class="chart-page-shell">
+      <div class="chart-page-header">
+        <button id="backToTrading" class="back-btn">← Back</button>
+        <div class="chart-page-title-wrap">
+          <div class="muted">Selected Ticker</div>
+          <h2 id="chartPageTicker">—</h2>
+        </div>
+      </div>
+
+      <div id="chartArea" class="chart-area chart-page-area">
+        <div class="chart-toolbar">
+          <div><strong id="chartSymbol">-</strong> <span id="chartPrice">$0.00</span></div>
+          <div>
+            <button class="tf-btn active" data-tf="1m">1m</button>
+            <button class="tf-btn" data-tf="5m">5m</button>
+          </div>
+        </div>
+        <div id="chartContainer" class="chart-main"></div>
+        <div id="macdContainer" class="chart-macd"></div>
+        <div id="setupInfo" class="setup-info">Setup: waiting…</div>
+      </div>
+
+      <div class="chart-bottom-grid">
+        <div class="sidebar-section poscalc-section-compact chart-poscalc-panel">
+          <div class="panel-title">📐 Position Size Calc</div>
+          <div class="poscalc-compact">
+            <div class="poscalc-field">
+              <label>Account ($)</label>
+              <input type="number" id="calcAccount" value="25000" min="1" step="1000" />
+            </div>
+            <div class="poscalc-field">
+              <label>Risk %</label>
+              <input type="number" id="calcRisk" value="1" min="0.1" max="100" step="0.1" />
+              <div class="poscalc-hint" id="calcRiskDollars">Risk: $250</div>
+            </div>
+            <div class="poscalc-field">
+              <label>Entry ($)</label>
+              <input type="number" id="calcEntry" placeholder="e.g. 5.50" min="0" step="0.01" />
+            </div>
+            <div class="poscalc-field">
+              <label>Stop ($)</label>
+              <input type="number" id="calcStop" placeholder="e.g. 5.00" min="0" step="0.01" />
+            </div>
+            <div class="poscalc-field">
+              <label>Target ($) <span class="muted">(opt)</span></label>
+              <input type="number" id="calcTarget" placeholder="e.g. 6.50" min="0" step="0.01" />
+            </div>
+          </div>
+          <div class="poscalc-results-compact">
+            <div class="poscalc-result-compact">
+              <div class="result-label">Shares</div>
+              <div class="result-value compact-val" id="calcShares">—</div>
+            </div>
+            <div class="poscalc-result-compact">
+              <div class="result-label">$ Risk</div>
+              <div class="result-value compact-val" id="calcDollarRisk">—</div>
+            </div>
+            <div class="poscalc-result-compact">
+              <div class="result-label">R:R</div>
+              <div class="result-value compact-val" id="calcRR">—</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="sidebar-section chart-entry-panel">
+          <div class="panel-title">Trade Entry</div>
+          <form id="chartTradeForm" class="chart-entry-form">
+            <div class="chart-entry-field">
+              <label for="chartTradeTicker">Ticker</label>
+              <input type="text" id="chartTradeTicker" readonly />
+            </div>
+            <div class="chart-entry-field">
+              <label for="chartTradeEntry">Entry Price ($)</label>
+              <input type="number" id="chartTradeEntry" min="0" step="0.01" />
+            </div>
+            <div class="chart-entry-field">
+              <label for="chartTradeShares">Shares</label>
+              <input type="number" id="chartTradeShares" min="1" step="1" placeholder="Auto from calc or manual" />
+            </div>
+            <button type="submit" id="chartTradeSubmit" class="save-journal-btn">Enter Trade</button>
+          </form>
+        </div>
+      </div>
+    </section>
+  </div><!-- /#view-chart -->
+
+
+  <!-- ===================================================
+       VIEW 2: ANALYTICS
+       Scrollable review page
+  ==================================================== -->
+  <div id="view-analytics" class="view-container analytics-view hidden">
+
+    <!-- Sticky date filter bar -->
+    <div class="date-filter-bar" id="dateFilterBar">
+      <span class="filter-label">Range:</span>
+      <button class="date-btn" data-range="today">Today</button>
+      <button class="date-btn" data-range="week">This Week</button>
+      <button class="date-btn" data-range="month">This Month</button>
+      <button class="date-btn active" data-range="alltime">All Time</button>
+    </div>
+
+    <!-- Two-panel row: performance cards + equity curve placeholder -->
+    <div class="analytics-top-row">
+      <!-- Left: performance summary cards -->
+      <div class="analytics-perf-panel">
+        <div id="analyticsStreak" class="analytics-streak muted">Loading...</div>
+        <div class="analytics-cards-grid" id="analyticsMetrics">
+          <div class="analytics-card"><div class="card-label">Win Rate</div><div class="card-value" id="aWinRate">—</div></div>
+          <div class="analytics-card"><div class="card-label">Profit Factor</div><div class="card-value" id="aProfitFactor">—</div></div>
+          <div class="analytics-card"><div class="card-label">Expectancy</div><div class="card-value" id="aExpectancy">—</div></div>
+          <div class="analytics-card"><div class="card-label">Avg Winner</div><div class="card-value green" id="aAvgWinner">—</div></div>
+          <div class="analytics-card"><div class="card-label">Avg Loser</div><div class="card-value red" id="aAvgLoser">—</div></div>
+          <div class="analytics-card"><div class="card-label">Avg Hold</div><div class="card-value" id="aAvgHold">—</div></div>
+          <div class="analytics-card"><div class="card-label">Max Win</div><div class="card-value green" id="aMaxWin">—</div></div>
+          <div class="analytics-card"><div class="card-label">Max Loss</div><div class="card-value red" id="aMaxLoss">—</div></div>
+          <div class="analytics-card"><div class="card-label">Streak</div><div class="card-value" id="aStreakCard">—</div></div>
+        </div>
+      </div>
+
+      <!-- Right: equity curve placeholder -->
+      <div class="analytics-equity-panel">
+        <div class="panel-title">Equity Curve</div>
+        <div id="equityChart" class="equity-chart-placeholder">
+          <span class="coming-soon">Equity Curve — Coming Soon</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Breakdown tables with tabs -->
+    <div class="analytics-breakdown-section">
+      <div class="breakdown-tabs" role="tablist">
+        <button class="breakdown-tab active" data-table="byReason" role="tab">By Close Reason</button>
+        <button class="breakdown-tab" data-table="byHour" role="tab">By Time of Day</button>
+        <button class="breakdown-tab" data-table="byDay" role="tab">By Day of Week</button>
+        <button class="breakdown-tab" data-table="byGrade" role="tab">By Grade</button>
+      </div>
+
+      <div class="breakdown-table-wrap" id="breakdownByReason">
+        <table>
+          <thead><tr><th>Reason</th><th>Count</th><th>Total P&amp;L</th><th>Avg P&amp;L</th></tr></thead>
+          <tbody id="aByReason"></tbody>
+        </table>
+      </div>
+
+      <div class="breakdown-table-wrap hidden" id="breakdownByHour">
+        <table>
+          <thead><tr><th>Hour (ET)</th><th>Count</th><th>Total P&amp;L</th><th>Win%</th></tr></thead>
+          <tbody id="aByHour"></tbody>
+        </table>
+      </div>
+
+      <div class="breakdown-table-wrap hidden" id="breakdownByDay">
+        <table>
+          <thead><tr><th>Day</th><th>Count</th><th>Total P&amp;L</th><th>Win%</th></tr></thead>
+          <tbody id="aByDay"></tbody>
+        </table>
+      </div>
+
+      <div class="breakdown-table-wrap hidden" id="breakdownByGrade">
+        <table>
+          <thead><tr><th>Grade</th><th>Count</th><th>Avg P&amp;L</th><th>Win%</th></tr></thead>
+          <tbody id="aByGrade"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Full Trade Log -->
+    <div class="analytics-tradelog-section">
+      <div class="tradelog-header">
+        <h3>Full Trade Log</h3>
+        <select id="tradeLogFilter" class="tradelog-filter">
+          <option value="all">All Trades</option>
+          <option value="winner">Winners Only</option>
+          <option value="loser">Losers Only</option>
+          <option value="open">Open Only</option>
+        </select>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>ID</th><th>Ticker</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Status</th><th>Entry Time</th><th>Exit Time</th><th>Journal</th></tr></thead>
+          <tbody id="tradeLogBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div><!-- /#view-analytics -->
+
+
+  <!-- ===================================================
+       OVERLAYS (always in DOM, z-index above views)
+  ==================================================== -->
+
+  <!-- Settings Panel -->
+  <aside id="settingsPanel" class="settings-panel hidden">
+    <div class="settings-head">
+      <h3>Settings</h3>
+      <button id="settingsClose">✕</button>
+    </div>
+    <div class="settings-body">
+      <h4>Scanner Thresholds</h4>
+      <label>Min Gap % <input id="setMinGap" type="number" step="0.1" /></label>
+      <label>Min Price <input id="setMinPrice" type="number" step="0.01" /></label>
+      <label>Max Price <input id="setMaxPrice" type="number" step="0.01" /></label>
+      <label>Min RelVol <input id="setMinRelVol" type="number" step="0.1" /></label>
+      <label>Max Float <input id="setMaxFloat" type="number" step="1" /></label>
+      <label>Min Pillars <input id="setMinPillars" type="number" step="1" min="1" max="5" /></label>
+      <h4>Active Hours</h4>
+      <label>Scanner Start ET <input id="setStartHour" type="number" min="0" max="23" /></label>
+      <label>Scanner End ET <input id="setEndHour" type="number" min="0" max="23" /></label>
+      <label>Primary Window Start ET <input id="setPrimaryStart" type="number" min="0" max="23" /></label>
+      <label>Primary Window End ET <input id="setPrimaryEnd" type="number" min="0" max="23" /></label>
+      <h4>Simulator</h4>
+      <label>Account Size <input id="setAccountSize" type="number" step="1" /></label>
+      <button id="saveSettings" class="save-btn">Save Settings</button>
+      <div id="saveStatus" class="muted"></div>
+    </div>
+  </aside>
+
+  <!-- Pre-Trade Checklist Modal -->
+  <div class="modal-overlay" id="preTradeModal">
+    <div class="modal-box">
+      <button class="modal-close" id="preTradeModalClose">✕</button>
+      <h3>✅ Pre-Trade Checklist</h3>
+      <div class="pretrade-subtitle">Pause before you enter. Confirm the process, then take the trade.</div>
+      <input type="hidden" id="preTradeTicker" />
+      <input type="hidden" id="preTradePrice" />
+      <input type="hidden" id="preTradeDbId" />
+
+      <div class="pretrade-symbol-row">
+        <span class="pill pill-gray" id="preTradeSymbolBadge">—</span>
+        <span class="muted" id="preTradePriceText">Entry: —</span>
+      </div>
+
+      <div class="pretrade-checklist" id="preTradeChecklist">
+        <label class="pretrade-item"><input type="checkbox" data-checklist-item="setup" /> <span>✅ A+ setup — clear pattern, high conviction</span></label>
+        <label class="pretrade-item"><input type="checkbox" data-checklist-item="stop" /> <span>✅ Stop loss placed and defined</span></label>
+        <label class="pretrade-item"><input type="checkbox" data-checklist-item="size" /> <span>✅ Position sized correctly (per position size calculator)</span></label>
+        <label class="pretrade-item"><input type="checkbox" data-checklist-item="dailyLoss" /> <span>✅ Within daily loss limit</span></label>
+      </div>
+
+      <div class="pretrade-actions">
+        <button id="preTradeCancel" class="pretrade-cancel-btn">Cancel</button>
+        <button id="preTradeConfirm" class="save-journal-btn" disabled>Confirm &amp; Enter Trade</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Trade Journal Modal -->
+  <div class="modal-overlay" id="journalModal">
+    <div class="modal-box">
+      <button class="modal-close" id="journalModalClose">✕</button>
+      <h3>📝 Trade Journal</h3>
+      <input type="hidden" id="journalTradeId" />
+
+      <div class="modal-field">
+        <label>Setup Type</label>
+        <select id="journalSetup">
+          <option value="">— Select —</option>
+          <option value="bull_flag">Bull Flag</option>
+          <option value="abcd">ABCD Pattern</option>
+          <option value="vwap_bounce">VWAP Bounce</option>
+          <option value="orb">Opening Range Breakout</option>
+          <option value="momentum">Momentum</option>
+          <option value="other">Other</option>
+        </select>
+      </div>
+
+      <div class="modal-field">
+        <label>Emotional State</label>
+        <select id="journalEmotion">
+          <option value="">— Select —</option>
+          <option value="disciplined">Disciplined</option>
+          <option value="fomo">FOMO</option>
+          <option value="revenge">Revenge</option>
+          <option value="hesitant">Hesitant</option>
+          <option value="confident">Confident</option>
+        </select>
+      </div>
+
+      <div class="modal-field">
+        <label>Grade</label>
+        <div class="grade-btns">
+          <button class="grade-btn" data-grade="A">A</button>
+          <button class="grade-btn" data-grade="B">B</button>
+          <button class="grade-btn" data-grade="C">C</button>
+          <button class="grade-btn" data-grade="D">D</button>
+        </div>
+      </div>
+
+      <div class="modal-field">
+        <label>Mistakes</label>
+        <div class="mistakes-grid">
+          <label><input type="checkbox" value="chased_entry" /> Chased Entry</label>
+          <label><input type="checkbox" value="moved_stop" /> Moved Stop</label>
+          <label><input type="checkbox" value="overtraded" /> Overtraded</label>
+          <label><input type="checkbox" value="revenge_traded" /> Revenge Traded</label>
+          <label><input type="checkbox" value="held_through_target" /> Held Through Target</label>
+        </div>
+      </div>
+
+      <div class="modal-field">
+        <label>Notes</label>
+        <textarea id="journalNotes" placeholder="What happened? What did you learn?"></textarea>
+      </div>
+
+      <button class="save-journal-btn" id="journalSave">Save Journal Entry</button>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

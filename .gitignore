@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+logs/
+*.db
+*.db-*
+.env
+config.yaml
+config/*.yaml
+!config.example.yaml
