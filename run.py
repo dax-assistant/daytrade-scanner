@@ -23,6 +23,7 @@ from src.scanner import DayTradeScanner
 from src.simulator.engine import PaperTradingSimulator
 from src.simulator.reports import ReportGenerator
 from src.utils import get_market_session
+from src.trading.policy import TradingPolicy
 from src.web.app import create_app
 from src.web.ws_manager import WebSocketManager
 
@@ -37,6 +38,19 @@ def configure_logging(log_level: str) -> None:
 async def _main_async(config_path: Path) -> None:
     settings = load_settings(config_path)
     configure_logging(settings.logging.level)
+
+    trading_policy = TradingPolicy(settings)
+    trading_status = trading_policy.get_guard_status()
+    logging.getLogger(__name__).warning(
+        "Trading mode=%s broker=%s execution_allowed=%s reason=%s base_url=%s",
+        trading_status.mode,
+        trading_status.broker,
+        trading_status.allowed,
+        trading_status.reason,
+        trading_status.details.get("active_trading_base_url", ""),
+    )
+    if settings.trading.mode == "live" and not trading_status.allowed:
+        raise RuntimeError(f"Refusing startup in live mode: {trading_status.reason}")
 
     event_bus = EventBus()
     db = DatabaseManager(settings.database.path)

@@ -231,6 +231,104 @@ h3 { margin: 0; font-size: 15px; }
 }
 
 .panel-title { text-transform: uppercase; font-size: 12px; color: #93a1bc; margin-bottom: 8px; }
+.reconciliation-banner {
+  margin-bottom: 10px;
+  padding: 10px;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(120, 53, 15, 0.35), rgba(30, 41, 59, 0.95));
+}
+.reconciliation-banner.is-clear {
+  border-color: rgba(34, 197, 94, 0.28);
+  background: linear-gradient(135deg, rgba(20, 83, 45, 0.24), rgba(17, 24, 39, 0.94));
+}
+.reconciliation-banner-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+.reconciliation-summary {
+  font-size: 13px;
+  font-weight: 700;
+  color: #fde68a;
+}
+.reconciliation-banner.is-clear .reconciliation-summary {
+  color: #bbf7d0;
+}
+.reconciliation-issues {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.reconciliation-issue {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  color: #e2e8f0;
+  font-size: 11px;
+}
+.position-row-hold {
+  background: rgba(120, 53, 15, 0.22);
+}
+.position-row-hold td {
+  border-bottom-color: rgba(245, 158, 11, 0.25);
+}
+.position-status {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+.position-status-open {
+  background: rgba(34, 197, 94, 0.16);
+  color: #86efac;
+}
+.position-status-pending {
+  background: rgba(37, 99, 235, 0.18);
+  color: #bfdbfe;
+}
+.position-status-hold {
+  background: rgba(245, 158, 11, 0.2);
+  color: #fde68a;
+}
+.position-meta {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.broker-meta {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.reconcile-btn {
+  background: #1d4ed8;
+  color: #eff6ff;
+  border: 1px solid rgba(147, 197, 253, 0.35);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.reconcile-btn:hover {
+  background: #2563eb;
+}
+.reconcile-btn:disabled {
+  opacity: 0.45;
+  cursor: wait;
+}
 .empty-state { padding: 10px; border: 1px dashed var(--border-soft); border-radius: 8px; font-size: 12px; color: var(--muted); background: var(--panel-2); margin-bottom: 8px; }
 .watchlist { display: flex; flex-direction: column; gap: 8px; }
 .watch-card { border: 1px solid #2a395d; border-radius: 8px; padding: 10px; cursor: pointer; background: var(--panel-2); overflow: visible; }

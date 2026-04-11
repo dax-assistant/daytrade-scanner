@@ -14,7 +14,7 @@ import aiohttp
 import websockets
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
-from src.config import Settings
+from src.config import AlpacaTradingEnvConfig, Settings
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,8 +39,9 @@ class AlpacaWebSocketClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.url = settings.alpaca.websocket_url
-        self.key = settings.alpaca.key_id
-        self.secret = settings.alpaca.secret_key
+        active_env = self._get_active_trading_env_config()
+        self.key = active_env.key_id
+        self.secret = active_env.secret_key
         self.max_backoff = settings.runtime.websocket.reconnect_max_seconds
 
         self._ws = None
@@ -119,6 +120,9 @@ class AlpacaWebSocketClient:
         payload = {"action": "auth", "key": self.key, "secret": self.secret}
         await self._ws.send(json.dumps(payload))
 
+    def _get_active_trading_env_config(self) -> AlpacaTradingEnvConfig:
+        return self.settings.alpaca.live if self.settings.trading.mode == "live" else self.settings.alpaca.paper
+
     async def _handle_message(self, raw_message: str) -> None:
         try:
             messages = json.loads(raw_message)
@@ -162,9 +166,26 @@ class AlpacaClient:
 
     @property
     def headers(self) -> Dict[str, str]:
+        cfg = self.settings.alpaca.paper
         return {
-            "APCA-API-KEY-ID": self.settings.alpaca.key_id,
-            "APCA-API-SECRET-KEY": self.settings.alpaca.secret_key,
+            "APCA-API-KEY-ID": cfg.key_id,
+            "APCA-API-SECRET-KEY": cfg.secret_key,
+        }
+
+    def get_active_trading_env(self) -> str:
+        return "live" if self.settings.trading.mode == "live" else "paper"
+
+    def get_active_trading_config(self) -> AlpacaTradingEnvConfig:
+        return self.settings.alpaca.live if self.get_active_trading_env() == "live" else self.settings.alpaca.paper
+
+    def get_active_trading_base_url(self) -> str:
+        return self.get_active_trading_config().trading_base_url
+
+    def get_active_trading_headers(self) -> Dict[str, str]:
+        cfg = self.get_active_trading_config()
+        return {
+            "APCA-API-KEY-ID": cfg.key_id,
+            "APCA-API-SECRET-KEY": cfg.secret_key,
         }
 
     async def get_active_symbols(self) -> List[str]:
@@ -175,7 +196,7 @@ class AlpacaClient:
 
         path = "/v2/assets"
         params = {"status": "active", "asset_class": "us_equity"}
-        response = await self._request_json(self.settings.alpaca.trading_base_url, path, params=params)
+        response = await self._request_json(self.get_active_trading_base_url(), path, params=params)
 
         symbols = []
         for asset in response:
@@ -309,17 +330,34 @@ class AlpacaClient:
             "type": "market",
             "time_in_force": "day",
         }
-        response = await self._post_json(self.settings.alpaca.trading_base_url, path, payload)
+        response = await self._post_json(self.get_active_trading_base_url(), path, payload)
         return response if isinstance(response, dict) else {}
+
+    async def get_order(self, order_id: str) -> Dict[str, Any]:
+        path = f"/v2/orders/{order_id}"
+        response = await self._request_json(self.get_active_trading_base_url(), path)
+        return response if isinstance(response, dict) else {}
+
+    @staticmethod
+    def normalize_order_state(order: Dict[str, Any]) -> str:
+        return str(order.get("status") or "unknown").strip().lower() or "unknown"
+
+    @staticmethod
+    def order_filled_qty(order: Dict[str, Any]) -> int:
+        return int(float(order.get("filled_qty") or 0) or 0)
+
+    @staticmethod
+    def order_filled_avg_price(order: Dict[str, Any]) -> float:
+        return float(order.get("filled_avg_price") or 0.0)
 
     async def get_positions(self) -> List[Dict[str, Any]]:
         path = "/v2/positions"
-        response = await self._request_json(self.settings.alpaca.trading_base_url, path)
+        response = await self._request_json(self.get_active_trading_base_url(), path)
         return response if isinstance(response, list) else []
 
     async def get_account(self) -> Dict[str, Any]:
         path = "/v2/account"
-        response = await self._request_json(self.settings.alpaca.trading_base_url, path)
+        response = await self._request_json(self.get_active_trading_base_url(), path)
         return response if isinstance(response, dict) else {}
 
     async def get_latest_trade_price(self, symbol: str) -> Optional[float]:
@@ -360,7 +398,9 @@ class AlpacaClient:
         for attempt in range(1, max_attempts + 1):
             await self._rate_limiter.wait()
             try:
-                async with self._session.get(url, headers=self.headers, params=params) as resp:
+                active_base_url = self.get_active_trading_base_url().rstrip("/")
+                headers = self.get_active_trading_headers() if base_url.rstrip("/") == active_base_url else self.headers
+                async with self._session.get(url, headers=headers, params=params) as resp:
                     if resp.status == 429:
                         retry_after = int(resp.headers.get("Retry-After", "2"))
                         LOGGER.warning("Alpaca rate limited. Retrying in %ss", retry_after)
@@ -395,7 +435,9 @@ class AlpacaClient:
         for attempt in range(1, max_attempts + 1):
             await self._rate_limiter.wait()
             try:
-                async with self._session.post(url, headers=self.headers, json=payload) as resp:
+                active_base_url = self.get_active_trading_base_url().rstrip("/")
+                headers = self.get_active_trading_headers() if base_url.rstrip("/") == active_base_url else self.headers
+                async with self._session.post(url, headers=headers, json=payload) as resp:
                     if resp.status == 429:
                         retry_after = int(resp.headers.get("Retry-After", "2"))
                         LOGGER.warning("Alpaca POST rate limited. Retrying in %ss", retry_after)

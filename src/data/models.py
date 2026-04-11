@@ -110,6 +110,11 @@ class Trade:
     pnl: Optional[float]
     pnl_percent: Optional[float]
     alpaca_order_id: Optional[str]
+    broker_order_state: Optional[str]
+    broker_client_order_id: Optional[str]
+    broker_filled_qty: Optional[int]
+    broker_filled_avg_price: Optional[float]
+    broker_updated_at: Optional[datetime]
     close_reason: Optional[str]
     max_price_seen: float
 
@@ -117,6 +122,7 @@ class Trade:
         payload = asdict(self)
         payload["entry_time"] = self.entry_time.isoformat()
         payload["exit_time"] = self.exit_time.isoformat() if self.exit_time else None
+        payload["broker_updated_at"] = self.broker_updated_at.isoformat() if self.broker_updated_at else None
         return payload
 
     def to_dict_with_current_price(self, current_price: Optional[float] = None) -> Dict[str, Any]:

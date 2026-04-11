@@ -61,6 +61,11 @@ SCHEMA_STATEMENTS = [
         pnl REAL,
         pnl_percent REAL,
         alpaca_order_id TEXT,
+        broker_order_state TEXT,
+        broker_client_order_id TEXT,
+        broker_filled_qty INTEGER,
+        broker_filled_avg_price REAL,
+        broker_updated_at TEXT,
         close_reason TEXT,
         max_price_seen REAL,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -124,7 +129,24 @@ SCHEMA_STATEMENTS = [
 ]
 
 
+TRADE_COLUMN_MIGRATIONS = [
+    ("broker_order_state", "ALTER TABLE trades ADD COLUMN broker_order_state TEXT"),
+    ("broker_client_order_id", "ALTER TABLE trades ADD COLUMN broker_client_order_id TEXT"),
+    ("broker_filled_qty", "ALTER TABLE trades ADD COLUMN broker_filled_qty INTEGER"),
+    ("broker_filled_avg_price", "ALTER TABLE trades ADD COLUMN broker_filled_avg_price REAL"),
+    ("broker_updated_at", "ALTER TABLE trades ADD COLUMN broker_updated_at TEXT"),
+]
+
+
 async def run_migrations(conn: aiosqlite.Connection) -> None:
     for statement in SCHEMA_STATEMENTS:
         await conn.execute(statement)
+
+    async with conn.execute("PRAGMA table_info(trades)") as cursor:
+        rows = await cursor.fetchall()
+    existing_columns = {str(row[1]) for row in rows}
+    for column_name, statement in TRADE_COLUMN_MIGRATIONS:
+        if column_name not in existing_columns:
+            await conn.execute(statement)
+
     await conn.commit()

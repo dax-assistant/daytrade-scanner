@@ -14,6 +14,8 @@ from src.db.manager import DatabaseManager
 from src.event_bus import EventBus
 from src.indicators import evaluate_entry_signals
 from src.simulator.risk_profiles import get_profile, load_risk_profiles
+from src.trading.models import OrderIntent, TradingPolicyError
+from src.trading.policy import TradingPolicy
 
 LOGGER = logging.getLogger(__name__)
 
@@ -54,12 +56,16 @@ class PaperTradingSimulator:
         self._eod_summary_telegram: bool = settings.simulator.eod_summary_telegram
         self._simulated_slippage_bps: float = settings.simulator.simulated_slippage_bps
         self._reconcile_interval_seconds: int = settings.simulator.reconcile_interval_seconds
+        self._pending_order_stale_seconds: int = settings.simulator.pending_order_stale_seconds
+        self._reconciliation_position_mismatch_seconds: int = settings.simulator.reconciliation_position_mismatch_seconds
         self._latest_price_by_symbol: Dict[str, float] = {}
         self._latest_price_at_by_symbol: Dict[str, datetime] = {}
         self._last_reconciled_at: Optional[datetime] = None
         self._reconciliation_issues: list[str] = []
         self._broker_position_symbols: list[str] = []
         self._last_account_snapshot: Dict[str, float] = {}
+        self._symbol_missing_since: Dict[str, datetime] = {}
+        self._trading_policy = TradingPolicy(settings)
 
     async def start(self) -> None:
         if self._running:
@@ -69,8 +75,8 @@ class PaperTradingSimulator:
         await self._load_persisted_balance()
         await self._restore_daily_state()
 
-        open_trades = await self.db.get_open_trades()
-        self._open_trades = {trade.ticker.upper(): trade for trade in open_trades}
+        active_trades = await self.db.get_active_trades()
+        self._open_trades = {trade.ticker.upper(): trade for trade in active_trades}
 
         self.event_bus.on("scanner_hit", self.on_scanner_hit)
         self.event_bus.on("price_update", self.on_price_update)
@@ -194,7 +200,7 @@ class PaperTradingSimulator:
             )
             return
 
-        await self._enter_trade(candidate)
+        await self._enter_trade(candidate, source="scanner_auto")
 
     async def _evaluate_entry_signals(self, symbol: str) -> Dict[str, Any]:
         try:
@@ -245,7 +251,7 @@ class PaperTradingSimulator:
             )
         except Exception as exc:
             LOGGER.warning("Failed broker position reconciliation: %s", exc)
-            self._reconciliation_issues.append(f"broker_positions_unavailable:{exc}")
+            self._append_reconciliation_issue(f"broker_positions_unavailable:{exc}")
             self._broker_position_symbols = []
 
         try:
@@ -258,20 +264,298 @@ class PaperTradingSimulator:
             }
         except Exception as exc:
             LOGGER.warning("Failed broker account reconciliation: %s", exc)
-            self._reconciliation_issues.append(f"broker_account_unavailable:{exc}")
+            self._append_reconciliation_issue(f"broker_account_unavailable:{exc}")
             self._last_account_snapshot = {}
 
-        app_symbols = sorted(self._open_trades.keys())
+        for trade in list(self._open_trades.values()):
+            if trade.status in {"pending_entry", "pending_exit"}:
+                await self._reconcile_trade_order(trade)
+
+        app_symbols = sorted(symbol for symbol, trade in self._open_trades.items() if trade.status == "open")
         missing_in_broker = [symbol for symbol in app_symbols if symbol not in self._broker_position_symbols]
         unexpected_in_broker = [symbol for symbol in self._broker_position_symbols if symbol not in app_symbols]
-        issues = []
-        if missing_in_broker:
-            issues.append(f"missing_in_broker:{','.join(missing_in_broker)}")
-        if unexpected_in_broker:
-            issues.append(f"unexpected_in_broker:{','.join(unexpected_in_broker)}")
-        self._reconciliation_issues = (self._reconciliation_issues + issues)[-20:]
 
-    async def _enter_trade(self, candidate: StockCandidate) -> Optional[Trade]:
+        now = datetime.now(timezone.utc)
+        for symbol in missing_in_broker:
+            first_missing_at = self._symbol_missing_since.setdefault(symbol, now)
+            if (now - first_missing_at).total_seconds() < self._reconciliation_position_mismatch_seconds:
+                continue
+            trade = self._open_trades.get(symbol)
+            if trade and trade.status == "open":
+                self._append_reconciliation_issue(f"reconciliation_hold:{symbol}")
+                await self._quarantine_trade_for_mismatch(trade, "missing_broker_position")
+        for symbol, trade in list(self._open_trades.items()):
+            if symbol in self._broker_position_symbols:
+                self._symbol_missing_since.pop(symbol, None)
+                if trade.status == "reconciliation_hold" and trade.close_reason == "missing_broker_position":
+                    trade.status = "open"
+                    trade.close_reason = None
+                    await self.db.update_trade(trade)
+
+        if missing_in_broker:
+            self._append_reconciliation_issue(f"missing_in_broker:{','.join(missing_in_broker)}")
+        if unexpected_in_broker:
+            self._append_reconciliation_issue(f"unexpected_in_broker:{','.join(unexpected_in_broker)}")
+
+    def _build_order_intent(
+        self,
+        *,
+        symbol: str,
+        qty: int,
+        side: str,
+        source: str,
+        estimated_price: float,
+    ) -> OrderIntent:
+        normalized_qty = max(1, int(qty))
+        normalized_price = float(estimated_price)
+        return OrderIntent(
+            symbol=symbol.upper(),
+            side=side,
+            qty=normalized_qty,
+            estimated_price=normalized_price,
+            estimated_notional=float(normalized_qty) * normalized_price,
+            source=source,
+        )
+
+    def preview_broker_market_order(
+        self,
+        *,
+        symbol: str,
+        qty: int,
+        side: str,
+        source: str,
+        estimated_price: float,
+    ) -> Optional[str]:
+        intent = self._build_order_intent(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            source=source,
+            estimated_price=estimated_price,
+        )
+        try:
+            self._trading_policy.assert_order_allowed(intent)
+        except TradingPolicyError as exc:
+            return str(exc)
+        return None
+
+    async def _submit_broker_market_order(
+        self,
+        *,
+        symbol: str,
+        qty: int,
+        side: str,
+        source: str,
+        estimated_price: float,
+    ) -> Dict[str, Any]:
+        intent = self._build_order_intent(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            source=source,
+            estimated_price=estimated_price,
+        )
+        self._trading_policy.assert_order_allowed(intent)
+        return await self.alpaca_client.submit_market_order(symbol=symbol, qty=qty, side=side)
+
+    def _append_reconciliation_issue(self, issue: str) -> None:
+        self._reconciliation_issues = (self._reconciliation_issues + [issue])[-20:]
+
+    def _order_age_seconds(self, trade: Trade) -> float:
+        reference_time = trade.broker_updated_at or trade.entry_time
+        return max(0.0, (datetime.now(timezone.utc) - reference_time).total_seconds())
+
+    def _is_partial_fill(self, trade: Trade) -> bool:
+        state = (trade.broker_order_state or "").lower()
+        filled_qty = int(trade.broker_filled_qty or 0)
+        return state in {"partially_filled", "partial_fill"} or (0 < filled_qty < int(trade.quantity))
+
+    async def _quarantine_trade_for_mismatch(self, trade: Trade, reason: str) -> None:
+        trade.status = "reconciliation_hold"
+        trade.close_reason = reason
+        await self.db.update_trade(trade)
+
+    def _apply_broker_order_to_trade(self, trade: Trade, order: Dict[str, Any]) -> None:
+        trade.alpaca_order_id = str(order.get("id") or trade.alpaca_order_id or "") or None
+        trade.broker_order_state = self.alpaca_client.normalize_order_state(order)
+        trade.broker_client_order_id = str(order.get("client_order_id") or trade.broker_client_order_id or "") or None
+        filled_qty = self.alpaca_client.order_filled_qty(order)
+        trade.broker_filled_qty = filled_qty if filled_qty > 0 else None
+        filled_avg_price = self.alpaca_client.order_filled_avg_price(order)
+        trade.broker_filled_avg_price = filled_avg_price if filled_avg_price > 0 else None
+        broker_updated_raw = order.get("updated_at") or order.get("filled_at") or order.get("submitted_at")
+        if broker_updated_raw:
+            trade.broker_updated_at = datetime.fromisoformat(str(broker_updated_raw).replace("Z", "+00:00"))
+
+    async def _finalize_trade_close(self, trade: Trade, exit_price: float, reason: str) -> None:
+        trade.exit_price = float(exit_price)
+        trade.exit_time = trade.broker_updated_at or datetime.now(timezone.utc)
+        trade.status = reason
+        trade.close_reason = reason
+        trade.pnl = (trade.exit_price - trade.entry_price) * trade.quantity
+        trade.pnl_percent = ((trade.exit_price - trade.entry_price) / trade.entry_price) * 100.0
+
+        await self.db.update_trade(trade)
+        self._daily_pnl += trade.pnl
+        self._realized_pnl_today += trade.pnl
+        self._all_time_realized_pnl += trade.pnl
+        await self.db.set_simulator_state(
+            "current_balance", self._starting_balance + self._all_time_realized_pnl
+        )
+        self._open_trades.pop(trade.ticker, None)
+        await self.event_bus.emit("trade_closed", trade)
+
+    async def _open_trade_from_broker_fill(self, trade: Trade) -> None:
+        if trade.broker_filled_qty:
+            trade.quantity = trade.broker_filled_qty
+        if trade.broker_filled_avg_price:
+            trade.entry_price = trade.broker_filled_avg_price
+            profile = get_profile(self._profiles, trade.risk_profile)
+            trade.stop_loss = trade.entry_price * (1 - profile.stop_loss_pct / 100.0)
+            trade.take_profit = (
+                trade.entry_price * (1 + profile.take_profit_pct / 100.0)
+                if profile.take_profit_pct > 0
+                else None
+            )
+            trade.max_price_seen = trade.entry_price
+        trade.status = "open"
+        trade.close_reason = None
+        await self.db.update_trade(trade)
+        await self.event_bus.emit("trade_opened", trade)
+
+    async def _reconcile_held_trade_order(self, trade: Trade) -> None:
+        reason = trade.close_reason or ""
+        state = trade.broker_order_state or "unknown"
+
+        # Held trades only move when broker state makes the next state explicit.
+        if reason == "partial_entry_fill_stale":
+            if state == "filled":
+                await self._open_trade_from_broker_fill(trade)
+            else:
+                await self.db.update_trade(trade)
+            return
+
+        if reason == "partial_exit_fill_stale":
+            if state == "filled":
+                exit_price = trade.broker_filled_avg_price or trade.exit_price or trade.entry_price
+                await self._finalize_trade_close(trade, exit_price, "closed_manual")
+            else:
+                trade.exit_price = None
+                trade.exit_time = None
+                await self.db.update_trade(trade)
+            return
+
+        await self.db.update_trade(trade)
+
+    async def _reconcile_trade_order(self, trade: Trade) -> None:
+        if not self._use_alpaca_orders or not trade.alpaca_order_id:
+            return
+        try:
+            order = await self.alpaca_client.get_order(trade.alpaca_order_id)
+        except Exception as exc:
+            self._append_reconciliation_issue(f"broker_order_unavailable:{trade.ticker}:{exc}")
+            return
+
+        self._apply_broker_order_to_trade(trade, order)
+        state = trade.broker_order_state or "unknown"
+        is_partial_fill = self._is_partial_fill(trade)
+
+        if trade.status == "reconciliation_hold":
+            await self._reconcile_held_trade_order(trade)
+            return
+
+        if trade.status == "pending_entry":
+            if state == "filled":
+                await self._open_trade_from_broker_fill(trade)
+            elif state in {"canceled", "expired", "rejected"}:
+                trade.status = "entry_failed"
+                trade.close_reason = state
+                await self.db.update_trade(trade)
+                self._open_trades.pop(trade.ticker, None)
+            else:
+                if self._order_age_seconds(trade) >= self._pending_order_stale_seconds:
+                    if is_partial_fill:
+                        await self._quarantine_trade_for_mismatch(trade, "partial_entry_fill_stale")
+                        self._append_reconciliation_issue(f"stale_partial_pending_entry:{trade.ticker}")
+                    else:
+                        trade.status = "entry_failed"
+                        trade.close_reason = "stale_entry_order"
+                        await self.db.update_trade(trade)
+                        self._open_trades.pop(trade.ticker, None)
+                        self._append_reconciliation_issue(f"stale_pending_entry:{trade.ticker}")
+                else:
+                    await self.db.update_trade(trade)
+            return
+
+        if trade.status == "pending_exit":
+            if state == "filled":
+                exit_price = trade.broker_filled_avg_price or trade.exit_price or trade.entry_price
+                await self._finalize_trade_close(trade, exit_price, trade.close_reason or "closed_manual")
+            elif state in {"canceled", "expired", "rejected"}:
+                trade.status = "open"
+                trade.exit_price = None
+                trade.exit_time = None
+                trade.close_reason = None
+                await self.db.update_trade(trade)
+            else:
+                if self._order_age_seconds(trade) >= self._pending_order_stale_seconds:
+                    if is_partial_fill:
+                        trade.exit_price = None
+                        trade.exit_time = None
+                        await self._quarantine_trade_for_mismatch(trade, "partial_exit_fill_stale")
+                        self._append_reconciliation_issue(f"stale_partial_pending_exit:{trade.ticker}")
+                    else:
+                        self._append_reconciliation_issue(f"stale_pending_exit:{trade.ticker}")
+                        await self.db.update_trade(trade)
+                else:
+                    await self.db.update_trade(trade)
+
+    async def reconcile_now(self, trade_id: Optional[int] = None) -> Dict[str, Any]:
+        if trade_id is None:
+            await self._reconcile_state()
+            for trade in list(self._open_trades.values()):
+                await self.event_bus.emit("trade_updated", trade)
+            return {
+                "ok": True,
+                "scope": "all",
+                "trade_id": None,
+                "reconciliation": self.get_status().get("reconciliation", {}),
+            }
+
+        trade = await self.db.get_trade_by_id(trade_id)
+        if not trade:
+            return {"ok": False, "error": "trade_not_found", "trade_id": trade_id}
+
+        live_trade = self._open_trades.get(trade.ticker.upper())
+        if live_trade and live_trade.id == trade.id:
+            trade = live_trade
+
+        if trade.status not in {"open", "pending_entry", "pending_exit", "reconciliation_hold"}:
+            return {"ok": False, "error": "trade_not_active", "trade_id": trade_id}
+
+        if (
+            trade.status == "reconciliation_hold"
+            and trade.close_reason in {"partial_entry_fill_stale", "partial_exit_fill_stale"}
+            and trade.alpaca_order_id
+        ):
+            await self._reconcile_trade_order(trade)
+
+        await self._reconcile_state()
+        refreshed = await self.db.get_trade_by_id(trade_id)
+        if refreshed is not None:
+            active_trade = self._open_trades.get(refreshed.ticker.upper())
+            if active_trade and active_trade.id == refreshed.id:
+                await self.event_bus.emit("trade_updated", active_trade)
+
+        return {
+            "ok": True,
+            "scope": "trade",
+            "trade_id": trade_id,
+            "trade": refreshed.to_dict() if refreshed else None,
+            "reconciliation": self.get_status().get("reconciliation", {}),
+        }
+
+    async def _enter_trade(self, candidate: StockCandidate, source: str = "scanner_auto") -> Optional[Trade]:
         profile = get_profile(self._profiles, self._active_profile_name)
 
         market_reference_price = await self._get_market_reference_price(candidate.ticker)
@@ -291,19 +575,39 @@ class PaperTradingSimulator:
         take_profit = entry_price * (1 + profile.take_profit_pct / 100.0) if profile.take_profit_pct > 0 else None
         trailing_stop_pct = profile.trailing_stop_pct if profile.trailing_stop else None
 
+        initial_order: Optional[Dict[str, Any]] = None
         alpaca_order_id: Optional[str] = None
+        initial_status = "open"
         if self._use_alpaca_orders:
             try:
-                order = await self.alpaca_client.submit_market_order(symbol=candidate.ticker, qty=quantity, side="buy")
+                order = await self._submit_broker_market_order(
+                    symbol=candidate.ticker,
+                    qty=quantity,
+                    side="buy",
+                    source=source,
+                    estimated_price=entry_price,
+                )
+                initial_order = order
                 alpaca_order_id = str(order.get("id") or "") or None
+                broker_state = self.alpaca_client.normalize_order_state(order)
                 filled_avg_price = float(order.get("filled_avg_price") or 0.0)
+                if broker_state != "filled":
+                    initial_status = "pending_entry"
                 if filled_avg_price > 0:
                     entry_price = filled_avg_price
                     stop_loss = entry_price * (1 - profile.stop_loss_pct / 100.0)
                     take_profit = entry_price * (1 + profile.take_profit_pct / 100.0) if profile.take_profit_pct > 0 else None
+            except TradingPolicyError as exc:
+                LOGGER.warning("Execution blocked for %s buy order: %s", candidate.ticker, exc)
+                self._append_reconciliation_issue(f"execution_blocked:{candidate.ticker}:{exc}")
+                await self.event_bus.emit(
+                    "execution_blocked",
+                    {"ticker": candidate.ticker, "side": "buy", "reason": str(exc), "source": "scanner_auto"},
+                )
+                return None
             except Exception as exc:
                 LOGGER.warning("Failed to submit Alpaca paper buy order for %s: %s", candidate.ticker, exc)
-                self._reconciliation_issues.append(f"buy_order_failed:{candidate.ticker}")
+                self._append_reconciliation_issue(f"buy_order_failed:{candidate.ticker}")
                 return None
 
         trade = Trade(
@@ -320,19 +624,27 @@ class PaperTradingSimulator:
             take_profit=take_profit,
             trailing_stop_pct=trailing_stop_pct,
             quantity=quantity,
-            status="open",
+            status=initial_status,
             pnl=None,
             pnl_percent=None,
             alpaca_order_id=alpaca_order_id,
+            broker_order_state=None,
+            broker_client_order_id=None,
+            broker_filled_qty=None,
+            broker_filled_avg_price=None,
+            broker_updated_at=None,
             close_reason=None,
             max_price_seen=entry_price,
         )
+        if initial_order:
+            self._apply_broker_order_to_trade(trade, initial_order)
         trade.id = await self.db.insert_trade(trade)
         self._open_trades[trade.ticker] = trade
         self._latest_price_by_symbol[trade.ticker] = entry_price
         self._latest_price_at_by_symbol[trade.ticker] = datetime.now(timezone.utc)
 
-        await self.event_bus.emit("trade_opened", trade)
+        if trade.status == "open":
+            await self.event_bus.emit("trade_opened", trade)
         return trade
 
     async def on_price_update(self, data: Dict[str, Any]) -> None:
@@ -347,6 +659,8 @@ class PaperTradingSimulator:
 
         trade = self._open_trades[symbol]
         if current_price <= 0:
+            return
+        if trade.status != "open":
             return
 
         if current_price > trade.max_price_seen:
@@ -394,6 +708,8 @@ class PaperTradingSimulator:
                     last_date = today
                 to_close: list[tuple[Trade, float, str]] = []
                 for trade in list(self._open_trades.values()):
+                    if trade.status != "open":
+                        continue
                     profile = get_profile(self._profiles, trade.risk_profile)
                     hold_minutes = (now - trade.entry_time).total_seconds() / 60.0
                     current_price = await self._resolve_exit_market_price(trade)
@@ -409,6 +725,8 @@ class PaperTradingSimulator:
 
                 if self._daily_pnl <= -abs(self._max_daily_loss):
                     for trade in list(self._open_trades.values()):
+                        if trade.status != "open":
+                            continue
                         current_price = await self._resolve_exit_market_price(trade)
                         await self._close_trade(trade, current_price, "closed_risk")
 
@@ -430,34 +748,37 @@ class PaperTradingSimulator:
 
         if self._use_alpaca_orders:
             try:
-                order = await self.alpaca_client.submit_market_order(symbol=trade.ticker, qty=trade.quantity, side="sell")
-                filled_avg_price = float(order.get("filled_avg_price") or 0.0)
-                if filled_avg_price > 0:
-                    exit_price = filled_avg_price
+                order = await self._submit_broker_market_order(
+                    symbol=trade.ticker,
+                    qty=trade.quantity,
+                    side="sell",
+                    source=reason,
+                    estimated_price=exit_price,
+                )
+                self._apply_broker_order_to_trade(trade, order)
+                trade.close_reason = reason
+                if trade.broker_order_state != "filled":
+                    trade.status = "pending_exit"
+                    trade.exit_price = None
+                    trade.exit_time = None
+                    await self.db.update_trade(trade)
+                    return
+                if trade.broker_filled_avg_price:
+                    exit_price = trade.broker_filled_avg_price
+            except TradingPolicyError as exc:
+                LOGGER.warning("Execution blocked for %s sell order: %s", trade.ticker, exc)
+                self._append_reconciliation_issue(f"execution_blocked:{trade.ticker}:{exc}")
+                await self.event_bus.emit(
+                    "execution_blocked",
+                    {"ticker": trade.ticker, "side": "sell", "reason": str(exc), "source": reason},
+                )
+                return
             except Exception as exc:
                 LOGGER.warning("Failed to submit Alpaca paper sell order for %s: %s", trade.ticker, exc)
-                self._reconciliation_issues.append(f"sell_order_failed:{trade.ticker}")
+                self._append_reconciliation_issue(f"sell_order_failed:{trade.ticker}")
                 return
 
-        trade.exit_price = float(exit_price)
-        trade.exit_time = datetime.now(timezone.utc)
-        trade.status = reason
-        trade.close_reason = reason
-        trade.pnl = (trade.exit_price - trade.entry_price) * trade.quantity
-        trade.pnl_percent = ((trade.exit_price - trade.entry_price) / trade.entry_price) * 100.0
-
-        await self.db.update_trade(trade)
-        self._daily_pnl += trade.pnl
-        self._realized_pnl_today += trade.pnl
-        self._all_time_realized_pnl += trade.pnl
-
-        # Persist the updated balance so it survives restarts
-        await self.db.set_simulator_state(
-            "current_balance", self._starting_balance + self._all_time_realized_pnl
-        )
-
-        self._open_trades.pop(trade.ticker, None)
-        await self.event_bus.emit("trade_closed", trade)
+        await self._finalize_trade_close(trade, exit_price, reason)
 
     async def close_trade_by_id(self, trade_id: int) -> Optional[Trade]:
         trade = await self.db.get_trade_by_id(trade_id)
@@ -466,7 +787,7 @@ class PaperTradingSimulator:
 
         current_price = await self._resolve_exit_market_price(trade)
         await self._close_trade(trade, current_price, "closed_manual")
-        return trade
+        return trade if trade.status != "open" else None
 
     async def enter_manual_trade(self, data: Dict[str, Any]) -> Dict[str, Any]:
         if not self._enabled:
@@ -513,7 +834,20 @@ class PaperTradingSimulator:
             db_id=data.get("db_id"),
             pillars=pillars,
         )
-        trade = await self._enter_trade(candidate)
+        profile = get_profile(self._profiles, self._active_profile_name)
+        quantity = int((self.get_current_balance() * (profile.position_size_pct / 100.0)) / max(price, 0.01))
+        if self._use_alpaca_orders and quantity >= 1:
+            blocked_reason = self.preview_broker_market_order(
+                symbol=symbol,
+                qty=quantity,
+                side="buy",
+                source="manual_entry",
+                estimated_price=price,
+            )
+            if blocked_reason:
+                return {"ok": False, "error": blocked_reason}
+
+        trade = await self._enter_trade(candidate, source="manual_entry")
         if trade is None:
             return {"ok": False, "error": "trade_not_entered"}
         return {"ok": True, "trade": trade.to_dict()}
@@ -611,6 +945,7 @@ class PaperTradingSimulator:
                 "trailing_stop_pct": profile.trailing_stop_pct,
                 "max_hold_minutes": profile.max_hold_minutes,
             }
+        trading_status = self._trading_policy.get_guard_status().to_dict()
         return {
             "enabled": self._enabled,
             "active_profile": self._active_profile_name,
@@ -626,6 +961,8 @@ class PaperTradingSimulator:
                 "enabled": self._enabled,
                 "simulated_slippage_bps": self._simulated_slippage_bps,
                 "reconcile_interval_seconds": self._reconcile_interval_seconds,
+                "pending_order_stale_seconds": self._pending_order_stale_seconds,
+                "reconciliation_position_mismatch_seconds": self._reconciliation_position_mismatch_seconds,
             },
             "stats": {
                 "account_equity": 0.0,  # populated by route from Alpaca
@@ -649,6 +986,7 @@ class PaperTradingSimulator:
             "max_positions": self._max_positions,
             "max_daily_loss": self._max_daily_loss,
             "running": self._running,
+            "trading": trading_status,
         }
 
     async def change_profile(self, profile_name: str) -> Dict[str, Any]:

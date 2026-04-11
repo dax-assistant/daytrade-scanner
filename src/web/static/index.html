@@ -14,6 +14,9 @@
       <h1>⚡ Scanner Dashboard v3</h1>
       <span id="scannerState" class="pill pill-gray">connecting</span>
       <span id="sessionBadge" class="pill pill-gray">CLOSED</span>
+      <span id="tradingModeBadge" class="pill pill-yellow">PAPER MODE</span>
+      <span id="executionStatusBadge" class="pill pill-green">EXECUTION OK</span>
+      <span id="guardReasonText" class="muted">Guard: --</span>
       <span id="primaryCountdown" class="muted">Primary window: --</span>
     </div>
     <div class="header-center">
@@ -24,6 +27,8 @@
       </nav>
     </div>
     <div class="header-right">
+      <span id="authStatusText" class="muted">Auth: open</span>
+      <button id="logoutBtn" class="icon-btn hidden">🔒 Logout</button>
       <label class="toggle-row">
         <input type="checkbox" id="telegramToggle" /> Telegram
       </label>
@@ -65,9 +70,19 @@
 
       <div class="sidebar-section positions-section trading-positions-panel">
         <div class="panel-title">Open Positions</div>
+        <div id="reconciliationBanner" class="reconciliation-banner hidden">
+          <div class="reconciliation-banner-head">
+            <div>
+              <div id="reconciliationSummary" class="reconciliation-summary">Broker reconciliation healthy.</div>
+              <div id="reconciliationLastRun" class="muted">Last broker check: --</div>
+            </div>
+            <button id="reconcileAllBtn" class="reconcile-btn" type="button">Re-run Broker Reconcile</button>
+          </div>
+          <div id="reconciliationIssues" class="reconciliation-issues"></div>
+        </div>
         <div class="table-scroll">
           <table class="positions-table">
-            <thead><tr><th>Ticker</th><th>Entry</th><th>Curr</th><th>Target</th><th>Qty</th><th>P&amp;L</th><th>Stop</th><th>Time</th><th>Hold</th></tr></thead>
+            <thead><tr><th>Ticker</th><th>Status</th><th>Entry</th><th>Curr</th><th>Target</th><th>Qty</th><th>P&amp;L</th><th>Stop</th><th>Time</th><th>Broker</th><th>Action</th></tr></thead>
             <tbody id="positionsBody"></tbody>
           </table>
         </div>
@@ -351,6 +366,26 @@
         <button id="preTradeCancel" class="pretrade-cancel-btn">Cancel</button>
         <button id="preTradeConfirm" class="save-journal-btn" disabled>Confirm &amp; Enter Trade</button>
       </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="authModal">
+    <div class="modal-box">
+      <h3>🔐 Dashboard Login</h3>
+      <p id="authMessage" class="pretrade-subtitle">Authentication is required to use the control surface.</p>
+      <form id="authForm">
+        <div class="modal-field">
+          <label>Username</label>
+          <input id="authUsername" type="text" autocomplete="username" />
+        </div>
+        <div class="modal-field">
+          <label>Password</label>
+          <input id="authPassword" type="password" autocomplete="current-password" />
+        </div>
+        <div class="pretrade-actions">
+          <button type="submit" id="authSubmit" class="save-journal-btn">Login</button>
+        </div>
+      </form>
     </div>
   </div>
 

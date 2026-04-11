@@ -7,10 +7,13 @@ from typing import Optional
 import pytz
 import yaml
 from fastapi import APIRouter, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
+from src.audit import request_actor
 from src.indicators import compute_overlays, evaluate_entry_signals
+from src.trading.policy import TradingPolicy
 from src.utils import get_primary_window_info, get_session_info
+from src.web.auth import AUTH_COOKIE_NAME, AuthError, get_auth_status, login as auth_login, logout as auth_logout
 
 
 def create_routes() -> APIRouter:
@@ -28,9 +31,50 @@ def create_routes() -> APIRouter:
     async def health() -> dict:
         return {"status": "ok"}
 
+    @router.get("/api/auth/status")
+    async def auth_status(request: Request) -> dict:
+        return get_auth_status(request)
+
+    @router.post("/api/auth/login")
+    async def auth_login_route(request: Request):
+        body = await request.json()
+        username = str((body or {}).get("username") or "").strip()
+        password = str((body or {}).get("password") or "")
+        try:
+            result = auth_login(request, username=username, password=password)
+            auth_token = result.pop("auth_token")
+            response = JSONResponse(result)
+            response.set_cookie(
+                AUTH_COOKIE_NAME,
+                auth_token,
+                httponly=True,
+                samesite="lax",
+                secure=False,
+                path="/",
+            )
+            await _audit(
+                request,
+                "auth_login",
+                status="success",
+                details={"username": result.get("username"), "websocket_auth_enabled": result.get("ws_token") is not None},
+            )
+            return response
+        except AuthError as exc:
+            await _audit(request, "auth_login", status="failure", details={"username": username, "error": str(exc)})
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=401)
+
+    @router.post("/api/auth/logout")
+    async def auth_logout_route(request: Request):
+        await _audit(request, "auth_logout", status="success", details={})
+        auth_logout(request)
+        response = JSONResponse({"ok": True})
+        response.delete_cookie(AUTH_COOKIE_NAME, path="/")
+        return response
+
     @router.get("/api/config")
     async def config(request: Request) -> dict:
         settings = request.app.state.settings
+        trading_status = TradingPolicy(settings).get_guard_status()
         return {
             "environment": settings.environment,
             "timezone": settings.timezone,
@@ -38,6 +82,7 @@ def create_routes() -> APIRouter:
                 "enabled": settings.web.enabled,
                 "host": settings.web.host,
                 "port": settings.web.port,
+                "websocket_auth_enabled": settings.web.websocket_auth_enabled,
             },
             "simulator": {
                 "enabled": settings.simulator.enabled,
@@ -45,6 +90,14 @@ def create_routes() -> APIRouter:
                 "max_positions": settings.simulator.max_positions,
                 "max_daily_loss": settings.simulator.max_daily_loss,
                 "use_alpaca_orders": settings.simulator.use_alpaca_orders,
+            },
+            "trading": {
+                "mode": settings.trading.mode,
+                "broker": settings.trading.broker,
+                "execution_allowed": trading_status.allowed,
+                "guard_reason": trading_status.reason,
+                "live_enabled": settings.trading.live.enabled,
+                "active_trading_base_url": trading_status.details.get("active_trading_base_url", ""),
             },
             "notifications": {
                 "telegram_enabled": request.app.state.notification_router.get_settings().get("telegram_enabled", True)
@@ -59,15 +112,29 @@ def create_routes() -> APIRouter:
         enabled = notifier.get_settings().get("telegram_enabled", True) if notifier else True
         return {"telegram_enabled": enabled}
 
+    @router.get("/api/trading/status")
+    async def trading_status(request: Request) -> dict:
+        settings = request.app.state.settings
+        status = TradingPolicy(settings).get_guard_status()
+        return {
+            "mode": status.mode,
+            "broker": status.broker,
+            "execution_allowed": status.allowed,
+            "guard_reason": status.reason,
+            "details": status.details,
+        }
+
     @router.post("/api/settings/telegram")
     async def toggle_telegram(request: Request) -> dict:
         notifier = getattr(request.app.state, "notification_router", None)
         if notifier is None:
             return {"ok": False, "error": "notification_router_unavailable"}
         body = await request.json()
-        notifier.set_telegram_enabled(bool((body or {}).get("enabled", False)))
+        enabled = bool((body or {}).get("enabled", False))
+        notifier.set_telegram_enabled(enabled)
         await _save_config(request)
         await request.app.state.ws_manager.broadcast_config_updated("notifications", notifier.get_settings())
+        await _audit(request, "settings_telegram_updated", status="success", details={"telegram_enabled": enabled})
         return {"ok": True, "telegram_enabled": notifier.get_settings().get("telegram_enabled", False)}
 
     # ------------------------------------------------------------------ #
@@ -148,10 +215,12 @@ def create_routes() -> APIRouter:
         try:
             thresholds = await scanner.update_thresholds(body or {})
         except Exception as exc:
+            await _audit(request, "scanner_thresholds_updated", status="failure", details={"error": str(exc)})
             return {"ok": False, "error": str(exc)}
 
         await _save_config(request)
         await request.app.state.ws_manager.broadcast_config_updated("scanner", thresholds)
+        await _audit(request, "scanner_thresholds_updated", status="success", details={"fields": sorted((body or {}).keys())})
         return {"ok": True, "thresholds": thresholds}
 
     @router.get("/api/indicators/{symbol}")
@@ -229,8 +298,42 @@ def create_routes() -> APIRouter:
         simulator = request.app.state.simulator
         if not simulator:
             return {"ok": False, "error": "simulator_disabled"}
+
+        trade_record = await request.app.state.db.get_trade_by_id(trade_id)
+        if not trade_record or trade_record.status != "open":
+            await _audit(request, "trade_close_requested", status="failure", details={"trade_id": trade_id, "error": "trade_not_open"})
+            return {"ok": False, "error": "trade_not_open"}
+
+        current_price = await simulator._resolve_exit_market_price(trade_record)
+        if simulator._use_alpaca_orders:
+            blocked_reason = simulator.preview_broker_market_order(
+                symbol=trade_record.ticker,
+                qty=trade_record.quantity,
+                side="sell",
+                source="closed_manual",
+                estimated_price=current_price,
+            )
+            if blocked_reason:
+                await _audit(request, "trade_close_requested", status="blocked", details={"trade_id": trade_id, "ticker": trade_record.ticker, "reason": blocked_reason})
+                return {"ok": False, "error": blocked_reason}
+
         trade = await simulator.close_trade_by_id(trade_id)
-        return {"ok": trade is not None, "trade": trade.to_dict() if trade else None}
+        await _audit(request, "trade_close_requested", status="success" if trade else "failure", details={"trade_id": trade_id, "ticker": trade_record.ticker, "reason": None if trade else "trade_not_closed"})
+        return {"ok": trade is not None, "trade": trade.to_dict() if trade else None, "error": None if trade else "trade_not_closed"}
+
+    @router.post("/api/trades/{trade_id}/reconcile")
+    async def reconcile_trade(request: Request, trade_id: int) -> dict:
+        simulator = request.app.state.simulator
+        if not simulator:
+            return {"ok": False, "error": "simulator_disabled"}
+        result = await simulator.reconcile_now(trade_id=trade_id)
+        await _audit(
+            request,
+            "trade_reconcile_requested",
+            status="success" if result.get("ok") else "failure",
+            details={"trade_id": trade_id, "error": result.get("error")},
+        )
+        return result
 
     @router.post("/api/simulator/enter")
     async def manual_enter_trade(request: Request) -> dict:
@@ -238,7 +341,14 @@ def create_routes() -> APIRouter:
         if not simulator:
             return {"ok": False, "error": "simulator_disabled"}
         body = await request.json()
-        return await simulator.enter_manual_trade(body or {})
+        result = await simulator.enter_manual_trade(body or {})
+        await _audit(
+            request,
+            "trade_enter_requested",
+            status="success" if result.get("ok") else "failure",
+            details={"ticker": str((body or {}).get("ticker") or "").upper(), "error": result.get("error")},
+        )
+        return result
 
     @router.get("/api/simulator/positions")
     async def simulator_positions(request: Request) -> dict:
@@ -295,11 +405,13 @@ def create_routes() -> APIRouter:
         body = await request.json()
         account_size = float((body or {}).get("account_size", 0) or 0)
         if account_size <= 0:
+            await _audit(request, "simulator_account_updated", status="failure", details={"error": "account_size_must_be_positive"})
             return {"ok": False, "error": "account_size_must_be_positive"}
 
         await simulator.update_run_settings({"account_size": account_size})
         await _save_config(request)
         await request.app.state.ws_manager.broadcast_config_updated("simulator", {"account_size": account_size})
+        await _audit(request, "simulator_account_updated", status="success", details={"account_size": account_size})
         return {"ok": True, "account_size": account_size}
 
     # ------------------------------------------------------------------ #
@@ -313,6 +425,20 @@ def create_routes() -> APIRouter:
             return {"enabled": False}
         return simulator.get_status()
 
+    @router.post("/api/simulator/reconcile")
+    async def simulator_reconcile(request: Request) -> dict:
+        simulator = request.app.state.simulator
+        if not simulator:
+            return {"ok": False, "error": "simulator_disabled"}
+        result = await simulator.reconcile_now()
+        await _audit(
+            request,
+            "simulator_reconcile_requested",
+            status="success" if result.get("ok") else "failure",
+            details={"scope": result.get("scope"), "error": result.get("error")},
+        )
+        return result
+
     @router.post("/api/simulator/profile")
     async def simulator_profile(request: Request) -> dict:
         """Switch active profile, or update an existing profile's fields."""
@@ -324,14 +450,14 @@ def create_routes() -> APIRouter:
         fields = body.get("fields")
 
         if fields:
-            # Save field overrides and persist to config
             result = await simulator.save_profile_fields(profile_name, fields)
             if result.get("ok"):
                 await _save_config(request)
+            await _audit(request, "simulator_profile_updated", status="success" if result.get("ok") else "failure", details={"profile": profile_name, "fields": sorted(fields.keys()) if isinstance(fields, dict) else []})
             return result
         else:
-            # Just switch profiles
             result = await simulator.change_profile(profile_name)
+            await _audit(request, "simulator_profile_switched", status="success", details={"profile": profile_name})
             return {"ok": True, **result}
 
     @router.post("/api/simulator/profile/create")
@@ -343,6 +469,7 @@ def create_routes() -> APIRouter:
         body = await request.json()
         name = str(body.get("name", "")).strip().lower()
         if not name or not name.replace("_", "").isalnum():
+            await _audit(request, "simulator_profile_created", status="failure", details={"error": "invalid_name"})
             return {"ok": False, "error": "invalid_name"}
         fields = {
             "position_size_pct": float(body.get("position_size_pct", 5.0)),
@@ -354,6 +481,7 @@ def create_routes() -> APIRouter:
         }
         await simulator.create_profile(name, fields)
         await _save_config(request)
+        await _audit(request, "simulator_profile_created", status="success", details={"profile": name})
         return {"ok": True, "profile": name}
 
     @router.put("/api/simulator/settings")
@@ -366,6 +494,7 @@ def create_routes() -> APIRouter:
         await simulator.update_run_settings(body)
         await _save_config(request)
         await request.app.state.ws_manager.broadcast_config_updated("simulator", body)
+        await _audit(request, "simulator_settings_updated", status="success", details={"fields": sorted((body or {}).keys())})
         return {"ok": True, "settings": body}
 
     @router.post("/api/simulator/emergency-stop")
@@ -375,6 +504,7 @@ def create_routes() -> APIRouter:
         if not simulator:
             return {"ok": False, "error": "simulator_disabled"}
         closed = await simulator.emergency_stop()
+        await _audit(request, "simulator_emergency_stop", status="success", details={"closed_trades": len(closed) if isinstance(closed, list) else closed})
         return {"ok": True, "closed_trades": closed, "simulator_paused": True}
 
     # ------------------------------------------------------------------ #
@@ -679,6 +809,13 @@ def create_routes() -> APIRouter:
 # ------------------------------------------------------------------ #
 # Config persistence helper                                            #
 # ------------------------------------------------------------------ #
+
+
+async def _audit(request: Request, event: str, status: str, details: dict) -> None:
+    audit_logger = getattr(request.app.state, "audit_logger", None)
+    if audit_logger is None:
+        return
+    await audit_logger.log(event, {"status": status, "actor": request_actor(request), "details": details})
 
 
 async def _save_config(request: Request) -> None:

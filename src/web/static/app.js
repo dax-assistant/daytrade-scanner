@@ -17,8 +17,18 @@ const GLOSSARY = {
 const els = {
   scannerState: document.getElementById('scannerState'),
   sessionBadge: document.getElementById('sessionBadge'),
+  tradingModeBadge: document.getElementById('tradingModeBadge'),
+  executionStatusBadge: document.getElementById('executionStatusBadge'),
+  guardReasonText: document.getElementById('guardReasonText'),
   primaryCountdown: document.getElementById('primaryCountdown'),
   telegramToggle: document.getElementById('telegramToggle'),
+  authStatusText: document.getElementById('authStatusText'),
+  logoutBtn: document.getElementById('logoutBtn'),
+  authModal: document.getElementById('authModal'),
+  authMessage: document.getElementById('authMessage'),
+  authForm: document.getElementById('authForm'),
+  authUsername: document.getElementById('authUsername'),
+  authPassword: document.getElementById('authPassword'),
   watchlist: document.getElementById('watchlist'),
   watchlistLoading: document.getElementById('watchlistLoading'),
   watchlistEmpty: document.getElementById('watchlistEmpty'),
@@ -81,6 +91,11 @@ const els = {
   preTradePriceText: document.getElementById('preTradePriceText'),
   preTradeCancel: document.getElementById('preTradeCancel'),
   preTradeConfirm: document.getElementById('preTradeConfirm'),
+  reconciliationBanner: document.getElementById('reconciliationBanner'),
+  reconciliationSummary: document.getElementById('reconciliationSummary'),
+  reconciliationLastRun: document.getElementById('reconciliationLastRun'),
+  reconciliationIssues: document.getElementById('reconciliationIssues'),
+  reconcileAllBtn: document.getElementById('reconcileAllBtn'),
 };
 
 const state = {
@@ -93,7 +108,82 @@ const state = {
   journalEntries: [],
   gradeAnalytics: [],
   previousTradeStatus: {},
+  auth: {
+    enabled: false,
+    authenticated: true,
+    username: null,
+    websocket_auth_enabled: false,
+    ws_token: null,
+  },
 };
+
+function setAuthState(auth) {
+  state.auth = {
+    enabled: Boolean(auth?.enabled),
+    authenticated: Boolean(auth?.authenticated ?? !auth?.enabled),
+    username: auth?.username || null,
+    websocket_auth_enabled: Boolean(auth?.websocket_auth_enabled),
+    ws_token: auth?.ws_token || null,
+  };
+
+  if (els.authStatusText) {
+    if (!state.auth.enabled) els.authStatusText.textContent = 'Auth: open';
+    else if (state.auth.authenticated) els.authStatusText.textContent = `Auth: ${state.auth.username || 'ok'}`;
+    else els.authStatusText.textContent = 'Auth: login required';
+  }
+  if (els.logoutBtn) els.logoutBtn.classList.toggle('hidden', !(state.auth.enabled && state.auth.authenticated));
+  if (els.authModal) els.authModal.classList.toggle('active', Boolean(state.auth.enabled && !state.auth.authenticated));
+}
+
+function handleUnauthorized(message = 'Authentication required.') {
+  setAuthState({ ...state.auth, authenticated: false, ws_token: null });
+  if (els.authMessage) els.authMessage.textContent = message;
+  if (ws) {
+    try { ws.close(); } catch (err) {}
+  }
+}
+
+async function apiFetch(input, init = {}) {
+  const response = await fetch(input, { credentials: 'same-origin', ...init });
+  if (response.status === 401) {
+    handleUnauthorized('Your dashboard session expired. Log in again.');
+    throw new Error('authentication_required');
+  }
+  return response;
+}
+
+async function apiJson(input, fallback = {}, init = {}) {
+  try {
+    const response = await apiFetch(input, init);
+    return await response.json();
+  } catch (err) {
+    return fallback;
+  }
+}
+
+async function refreshAuthStatus() {
+  const auth = await apiJson('/api/auth/status', { enabled: false, authenticated: true, websocket_auth_enabled: false, ws_token: null });
+  setAuthState(auth);
+  return auth;
+}
+
+async function loginDashboard(username, password) {
+  const response = await fetch('/api/auth/login', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.ok) throw new Error(data.error || 'login_failed');
+  setAuthState(data);
+  if (els.authPassword) els.authPassword.value = '';
+}
+
+async function logoutDashboard() {
+  await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => null);
+  handleUnauthorized('Logged out. Log in to continue.');
+}
 
 let ws;
 let watchlistItems = [];
@@ -169,6 +259,38 @@ function setSessionBadge(session) {
 
 function fmtMoney(v) { return `$${Number(v || 0).toFixed(2)}`; }
 
+function prettifyGuardReason(reason) {
+  return String(reason || 'unknown').replaceAll('_', ' ');
+}
+
+function applyTradingStatus(status) {
+  const mode = String(status?.mode || 'paper').toLowerCase();
+  const allowed = Boolean(status?.execution_allowed);
+  const reason = prettifyGuardReason(status?.guard_reason || 'unknown');
+
+  if (els.tradingModeBadge) {
+    els.tradingModeBadge.textContent = mode === 'live' ? 'LIVE MODE' : 'PAPER MODE';
+    els.tradingModeBadge.className = 'pill ' + (mode === 'live' ? 'pill-red' : 'pill-yellow');
+  }
+
+  if (els.executionStatusBadge) {
+    els.executionStatusBadge.textContent = allowed ? 'EXECUTION OK' : 'EXECUTION BLOCKED';
+    els.executionStatusBadge.className = 'pill ' + (allowed ? 'pill-green' : 'pill-red');
+  }
+
+  if (els.guardReasonText) {
+    els.guardReasonText.textContent = `Guard: ${reason}`;
+  }
+
+  const blocked = !allowed;
+  const submitBtn = document.getElementById('chartTradeSubmit');
+  if (submitBtn) submitBtn.disabled = blocked;
+  document.querySelectorAll('[data-close-trade-id]').forEach(btn => {
+    btn.disabled = blocked;
+    btn.title = blocked ? `Execution blocked: ${reason}` : '';
+  });
+}
+
 function getStoredPreTradeChecklist() {
   try {
     const saved = JSON.parse(localStorage.getItem(PRE_TRADE_STORAGE_KEY) || '{}');
@@ -222,7 +344,7 @@ async function saveTradeGrade(tradeId, grade) {
     mistakes: existing.mistakes || null,
   };
 
-  const res = await fetch(`/api/journal/${tradeId}`, {
+  const res = await apiFetch(`/api/journal/${tradeId}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -292,7 +414,7 @@ async function submitPreTradeEntry() {
     ...(watchlistItems.find(item => (item.ticker || '').toUpperCase() === (els.preTradeTicker.value || '').toUpperCase()) || {}),
   };
 
-  const res = await fetch('/api/simulator/enter', {
+  const res = await apiFetch('/api/simulator/enter', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -447,17 +569,144 @@ function fmtDateTimeET(isoStr) {
   } catch (e) { return '-'; }
 }
 
-function renderPositions(data) {
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function formatReconciliationIssue(issue) {
+  const raw = String(issue || '').trim();
+  if (!raw) return 'Unknown reconciliation issue';
+  const parts = raw.split(':');
+  const kind = parts[0] || raw;
+  const rest = parts.slice(1).filter(Boolean);
+  const last = rest.length ? rest[rest.length - 1] : '';
+  const symbolList = last && /^[A-Z,]+$/.test(last) ? last.split(',').join(', ') : '';
+  const map = {
+    reconciliation_hold: symbolList ? `Held trade: ${symbolList}` : 'Held trade',
+    stale_partial_pending_entry: rest[0] ? `${rest[0]} partial entry fill is still stale` : 'Partial entry fill is still stale',
+    stale_partial_pending_exit: rest[0] ? `${rest[0]} partial exit fill is still stale` : 'Partial exit fill is still stale',
+    stale_pending_entry: rest[0] ? `${rest[0]} entry order is stale` : 'Entry order is stale',
+    stale_pending_exit: rest[0] ? `${rest[0]} exit order is stale` : 'Exit order is stale',
+    missing_in_broker: symbolList ? `Missing at broker: ${symbolList}` : 'Application position missing at broker',
+    unexpected_in_broker: symbolList ? `Unexpected broker position: ${symbolList}` : 'Unexpected broker position',
+    broker_positions_unavailable: `Broker positions unavailable${last ? `: ${last}` : ''}`,
+    broker_account_unavailable: `Broker account unavailable${last ? `: ${last}` : ''}`,
+    broker_order_unavailable: rest[0] ? `${rest[0]} broker order unavailable` : 'Broker order unavailable',
+  };
+  return map[kind] || raw.replaceAll('_', ' ');
+}
+
+function positionStatusMeta(trade) {
+  if (trade.status === 'reconciliation_hold') {
+    return { label: 'Hold', className: 'position-status-hold' };
+  }
+  if (trade.status === 'pending_entry' || trade.status === 'pending_exit') {
+    return { label: trade.status === 'pending_entry' ? 'Pending Entry' : 'Pending Exit', className: 'position-status-pending' };
+  }
+  return { label: String(trade.status || 'open').replaceAll('_', ' '), className: 'position-status-open' };
+}
+
+async function triggerBrokerReconcile(tradeId = null, button = null) {
+  if (button) button.disabled = true;
+  const label = button ? button.textContent : '';
+  if (button) button.textContent = 'Reconciling...';
+  const endpoint = tradeId == null ? '/api/simulator/reconcile' : `/api/trades/${tradeId}/reconcile`;
+  try {
+    const response = await apiFetch(endpoint, { method: 'POST' });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) throw new Error(data.error || 'reconcile_failed');
+    alertLine(tradeId == null ? 'Broker reconciliation re-run complete.' : `Broker reconciliation re-run for trade ${tradeId}.`);
+    await refreshData();
+  } catch (err) {
+    alertLine(`Broker reconciliation failed: ${err.message}`);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = label;
+    }
+  }
+}
+
+function renderReconciliationBanner(items, simStatus) {
+  const heldTrades = (items || []).filter(item => item.status === 'reconciliation_hold');
+  const issues = simStatus?.reconciliation?.issues || [];
+  const hasItems = heldTrades.length > 0 || issues.length > 0;
+
+  if (!els.reconciliationBanner || !els.reconciliationSummary || !els.reconciliationLastRun || !els.reconciliationIssues) return;
+
+  els.reconciliationBanner.classList.toggle('hidden', !hasItems);
+  els.reconciliationBanner.classList.toggle('is-clear', heldTrades.length === 0 && issues.length === 0);
+  if (!hasItems) {
+    els.reconciliationIssues.innerHTML = '';
+    return;
+  }
+
+  const lastRun = simStatus?.reconciliation?.last_reconciled_at;
+  els.reconciliationSummary.textContent = heldTrades.length > 0
+    ? `${heldTrades.length} held trade${heldTrades.length === 1 ? '' : 's'} need broker review.`
+    : 'Recent broker reconciliation issues detected.';
+  els.reconciliationLastRun.textContent = `Last broker check: ${lastRun ? fmtDateTimeET(lastRun) : '--'}`;
+
+  const issueItems = [];
+  heldTrades.forEach(trade => {
+    issueItems.push(`HOLD ${trade.ticker}: ${trade.close_reason || trade.status}`);
+  });
+  issues.slice(-6).reverse().forEach(issue => issueItems.push(formatReconciliationIssue(issue)));
+  const seen = new Set();
+  els.reconciliationIssues.innerHTML = issueItems
+    .filter(item => {
+      const key = item.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .map(item => `<span class="reconciliation-issue">${escapeHtml(item)}</span>`)
+    .join('');
+}
+
+function renderPositions(data, simStatus = {}) {
   const items = data.items || [];
   els.positionsBody.innerHTML = '';
+  renderReconciliationBanner(items, simStatus);
   items.forEach(t => {
     const pnl = Number(t.unrealized_pnl || 0);
     const entryTime = fmtTimeET(t.entry_time);
     const hold = t.hold_minutes != null ? `${t.hold_minutes}m` : '-';
     const target = (t.take_profit ?? t.target_price) != null ? Number(t.take_profit ?? t.target_price).toFixed(2) : '-';
+    const statusMeta = positionStatusMeta(t);
+    const brokerFilled = t.broker_filled_qty != null ? `${t.broker_filled_qty} @ ${Number(t.broker_filled_avg_price || 0).toFixed(2)}` : '—';
+    const brokerState = t.broker_order_state || '—';
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${t.ticker}</td><td>${Number(t.entry_price || 0).toFixed(2)}</td><td>${Number(t.current_price || 0).toFixed(2)}</td><td>${target}</td><td>${t.quantity || 0}</td><td class="${pnl >= 0 ? 'green' : 'red'}">${pnl.toFixed(2)}</td><td>${Number(t.stop_loss || 0).toFixed(2)}</td><td>${entryTime}</td><td>${hold}</td>`;
+    tr.className = t.status === 'reconciliation_hold' ? 'position-row-hold' : '';
+    tr.innerHTML = `
+      <td><strong>${escapeHtml(t.ticker || '-')}</strong></td>
+      <td>
+        <span class="position-status ${statusMeta.className}">${escapeHtml(statusMeta.label)}</span>
+        <div class="position-meta">Reason: ${escapeHtml(t.close_reason || '—')}</div>
+      </td>
+      <td>${Number(t.entry_price || 0).toFixed(2)}</td>
+      <td>${Number(t.current_price || 0).toFixed(2)}</td>
+      <td>${target}</td>
+      <td>${t.quantity || 0}</td>
+      <td class="${pnl >= 0 ? 'green' : 'red'}">${pnl.toFixed(2)}</td>
+      <td>${Number(t.stop_loss || 0).toFixed(2)}</td>
+      <td>${entryTime}<div class="position-meta">${hold}</div></td>
+      <td>
+        <div class="broker-meta">State: ${escapeHtml(brokerState)}</div>
+        <div class="broker-meta">Filled: ${escapeHtml(brokerFilled)}</div>
+        <div class="broker-meta">Updated: ${escapeHtml(fmtTimeET(t.broker_updated_at))}</div>
+      </td>
+      <td>${t.status === 'reconciliation_hold' ? `<button class="reconcile-btn" data-reconcile-tradeid="${t.id}">Reconcile</button>` : '<span class="muted">—</span>'}</td>
+    `;
     els.positionsBody.appendChild(tr);
+  });
+  document.querySelectorAll('[data-reconcile-tradeid]').forEach(btn => {
+    btn.onclick = () => triggerBrokerReconcile(Number(btn.dataset.reconcileTradeid), btn);
   });
   els.openCount.textContent = items.length;
   els.accountBalance.textContent = fmtMoney(data.current_balance || 0);
@@ -550,10 +799,17 @@ function renderChartUpdate(data) {
 }
 
 function connectWs() {
+  if (state.auth.enabled && !state.auth.authenticated) return;
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${scheme}://${location.host}/ws`);
+  const tokenQuery = state.auth.websocket_auth_enabled && state.auth.ws_token
+    ? `?token=${encodeURIComponent(state.auth.ws_token)}`
+    : '';
+  ws = new WebSocket(`${scheme}://${location.host}/ws${tokenQuery}`);
   ws.onopen = () => { if (selectedSymbol) subscribeChart(selectedSymbol, currentTf); };
-  ws.onclose = () => setTimeout(connectWs, 1500);
+  ws.onclose = () => {
+    if (state.auth.enabled && !state.auth.authenticated) return;
+    setTimeout(connectWs, 1500);
+  };
   ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
     const { event: ev, data } = msg;
@@ -665,7 +921,7 @@ function initViewTabs() {
 
 
 async function loadThresholds() {
-  thresholds = await fetch('/api/scanner/thresholds').then(r => r.json()).catch(() => ({}));
+  thresholds = await apiJson('/api/scanner/thresholds', {});
   document.getElementById('setMinGap').value = thresholds.min_gap_percent ?? '';
   document.getElementById('setMinPrice').value = thresholds.min_price ?? '';
   document.getElementById('setMaxPrice').value = thresholds.max_price ?? '';
@@ -824,17 +1080,19 @@ function renderTradeLog() {
 }
 
 async function refreshData() {
-  const [watchlist, scannerStatus, positions, history, simStatus, alltime, journalAll, analytics, gradeAnalytics, allTrades] = await Promise.all([
-    fetch('/api/scanner/watchlist').then(r => r.json()).catch(() => ({ items: [] })),
-    fetch('/api/scanner/status').then(r => r.json()).catch(() => ({})),
-    fetch('/api/simulator/positions').then(r => r.json()).catch(() => ({ items: [] })),
-    fetch('/api/simulator/history').then(r => r.json()).catch(() => ({ items: [], stats: {} })),
-    fetch('/api/simulator/status').then(r => r.json()).catch(() => ({})),
-    fetch('/api/simulator/alltime').then(r => r.json()).catch(() => ({ total_pnl: 0, total_trades: 0 })),
-    fetch('/api/journal').then(r => r.json()).catch(() => ({ items: [] })),
-    fetch(`/api/analytics/summary?range=${encodeURIComponent(state.analyticsRange)}`).then(r => r.json()).catch(() => ({})),
-    fetch(`/api/analytics/grades?range=${encodeURIComponent(state.analyticsRange)}`).then(r => r.json()).catch(() => ({ items: [] })),
-    fetch('/api/trades?limit=100000').then(r => r.json()).catch(() => ({ items: [] })),
+  if (state.auth.enabled && !state.auth.authenticated) return;
+  const [watchlist, scannerStatus, positions, history, simStatus, tradingStatus, alltime, journalAll, analytics, gradeAnalytics, allTrades] = await Promise.all([
+    apiJson('/api/scanner/watchlist', { items: [] }),
+    apiJson('/api/scanner/status', {}),
+    apiJson('/api/simulator/positions', { items: [] }),
+    apiJson('/api/simulator/history', { items: [], stats: {} }),
+    apiJson('/api/simulator/status', {}),
+    apiJson('/api/trading/status', { mode: 'paper', execution_allowed: true, guard_reason: 'paper_mode' }),
+    apiJson('/api/simulator/alltime', { total_pnl: 0, total_trades: 0 }),
+    apiJson('/api/journal', { items: [] }),
+    apiJson(`/api/analytics/summary?range=${encodeURIComponent(state.analyticsRange)}`, {}),
+    apiJson(`/api/analytics/grades?range=${encodeURIComponent(state.analyticsRange)}`, { items: [] }),
+    apiJson('/api/trades?limit=100000', { items: [] }),
   ]);
 
   journalEntryMap = {};
@@ -852,8 +1110,9 @@ async function refreshData() {
   statusPill(scannerStatus.state || 'unknown');
   setSessionBadge(scannerStatus.session || 'closed');
   updatePrimaryCountdown(scannerStatus.primary_window);
+  applyTradingStatus(tradingStatus);
 
-  renderPositions(positions);
+  renderPositions(positions, simStatus);
   renderHistory(history);
   renderTradeLog();
   updateLossMeter(simStatus);
@@ -892,11 +1151,11 @@ function initSettings() {
     };
     const accountPayload = { account_size: Number(document.getElementById('setAccountSize').value || 0) };
 
-    await fetch('/api/scanner/thresholds', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(scannerPayload) });
+    await apiFetch('/api/scanner/thresholds', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(scannerPayload) });
     if (accountPayload.account_size > 0) {
-      await fetch('/api/simulator/account', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(accountPayload) });
+      await apiFetch('/api/simulator/account', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(accountPayload) });
     }
-    await fetch('/api/settings/telegram', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: els.telegramToggle.checked }) });
+    await apiFetch('/api/settings/telegram', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: els.telegramToggle.checked }) });
 
     els.saveStatus.textContent = '✓ Saved';
     setTimeout(() => { els.settingsPanel.classList.add('hidden'); els.saveStatus.textContent = ''; }, 800);
@@ -907,7 +1166,7 @@ function initSettings() {
 
 function initTelegramToggle() {
   els.telegramToggle.onchange = async () => {
-    await fetch('/api/settings/telegram', {
+    await apiFetch('/api/settings/telegram', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enabled: els.telegramToggle.checked }),
@@ -925,7 +1184,7 @@ async function openJournalModal(tradeId) {
   document.querySelectorAll('.mistakes-grid input[type=checkbox]').forEach(cb => cb.checked = false);
 
   try {
-    const res = await fetch(`/api/journal/${tradeId}`);
+    const res = await apiFetch(`/api/journal/${tradeId}`);
     const data = await res.json();
     if (data.entry) {
       const e = data.entry;
@@ -980,7 +1239,7 @@ function initJournalModal() {
       mistakes: mistakes || null,
     };
     try {
-      const res = await fetch(`/api/journal/${tradeId}`, {
+      const res = await apiFetch(`/api/journal/${tradeId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -1093,6 +1352,24 @@ function initPositionCalculator() {
   calcPositionSize();
 }
 
+function initAuth() {
+  if (els.authForm) {
+    els.authForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      try {
+        await loginDashboard(els.authUsername?.value || '', els.authPassword?.value || '');
+        if (els.authMessage) els.authMessage.textContent = 'Authenticated.';
+        await loadThresholds();
+        await refreshData();
+        connectWs();
+      } catch (err) {
+        if (els.authMessage) els.authMessage.textContent = 'Login failed. Check credentials.';
+      }
+    });
+  }
+  if (els.logoutBtn) els.logoutBtn.onclick = () => logoutDashboard();
+}
+
 async function init() {
   initGlossary();
   initSettings();
@@ -1101,13 +1378,21 @@ async function init() {
   initPreTradeModal();
   initPositionCalculator();
   initChartTradeForm();
+  if (els.reconcileAllBtn) els.reconcileAllBtn.onclick = () => triggerBrokerReconcile(null, els.reconcileAllBtn);
   initViewTabs();
   initAnalyticsControls();
+  initAuth();
 
-  const settings = await fetch('/api/settings').then(r => r.json()).catch(() => ({ telegram_enabled: true }));
+  const auth = await refreshAuthStatus();
+  if (auth.enabled && !auth.authenticated) {
+    if (els.authUsername) els.authUsername.focus();
+    return;
+  }
+
+  const settings = await apiJson('/api/settings', { telegram_enabled: true });
   els.telegramToggle.checked = settings.telegram_enabled !== false;
 
-  const sim = await fetch('/api/simulator/status').then(r => r.json()).catch(() => ({}));
+  const sim = await apiJson('/api/simulator/status', {});
   document.getElementById('setAccountSize').value = sim?.run_controls?.account_size || 25000;
 
   document.querySelectorAll('.tf-btn').forEach(btn => {

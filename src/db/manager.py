@@ -124,9 +124,10 @@ class DatabaseManager:
                 INSERT INTO trades (
                     scanner_hit_id, ticker, side, risk_profile, entry_price, entry_time,
                     exit_price, exit_time, stop_loss, take_profit, trailing_stop_pct,
-                    quantity, status, pnl, pnl_percent, alpaca_order_id, close_reason,
-                    max_price_seen, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    quantity, status, pnl, pnl_percent, alpaca_order_id, broker_order_state,
+                    broker_client_order_id, broker_filled_qty, broker_filled_avg_price, broker_updated_at,
+                    close_reason, max_price_seen, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trade.scanner_hit_id,
@@ -145,6 +146,11 @@ class DatabaseManager:
                     trade.pnl,
                     trade.pnl_percent,
                     trade.alpaca_order_id,
+                    trade.broker_order_state,
+                    trade.broker_client_order_id,
+                    trade.broker_filled_qty,
+                    trade.broker_filled_avg_price,
+                    trade.broker_updated_at.isoformat() if trade.broker_updated_at else None,
                     trade.close_reason,
                     trade.max_price_seen,
                     datetime.now(timezone.utc).isoformat(),
@@ -161,12 +167,15 @@ class DatabaseManager:
             await conn.execute(
                 """
                 UPDATE trades
-                SET exit_price = ?, exit_time = ?, stop_loss = ?, take_profit = ?,
+                SET entry_price = ?, exit_price = ?, exit_time = ?, stop_loss = ?, take_profit = ?,
                     trailing_stop_pct = ?, quantity = ?, status = ?, pnl = ?, pnl_percent = ?,
-                    alpaca_order_id = ?, close_reason = ?, max_price_seen = ?, updated_at = ?
+                    alpaca_order_id = ?, broker_order_state = ?, broker_client_order_id = ?,
+                    broker_filled_qty = ?, broker_filled_avg_price = ?, broker_updated_at = ?,
+                    close_reason = ?, max_price_seen = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
+                    trade.entry_price,
                     trade.exit_price,
                     trade.exit_time.isoformat() if trade.exit_time else None,
                     trade.stop_loss,
@@ -177,6 +186,11 @@ class DatabaseManager:
                     trade.pnl,
                     trade.pnl_percent,
                     trade.alpaca_order_id,
+                    trade.broker_order_state,
+                    trade.broker_client_order_id,
+                    trade.broker_filled_qty,
+                    trade.broker_filled_avg_price,
+                    trade.broker_updated_at.isoformat() if trade.broker_updated_at else None,
                     trade.close_reason,
                     trade.max_price_seen,
                     datetime.now(timezone.utc).isoformat(),
@@ -187,6 +201,11 @@ class DatabaseManager:
 
     async def get_open_trades(self) -> List[Trade]:
         return await self._fetch_trades("SELECT * FROM trades WHERE status = 'open' ORDER BY entry_time ASC")
+
+    async def get_active_trades(self) -> List[Trade]:
+        return await self._fetch_trades(
+            "SELECT * FROM trades WHERE status IN ('open', 'pending_entry', 'pending_exit', 'reconciliation_hold') ORDER BY entry_time ASC"
+        )
 
     async def get_trades_today(self) -> List[Trade]:
         date_prefix = datetime.now(timezone.utc).date().isoformat()
@@ -791,6 +810,11 @@ class DatabaseManager:
             pnl=float(row["pnl"]) if row["pnl"] is not None else None,
             pnl_percent=float(row["pnl_percent"]) if row["pnl_percent"] is not None else None,
             alpaca_order_id=str(row["alpaca_order_id"]) if row["alpaca_order_id"] else None,
+            broker_order_state=str(row["broker_order_state"]) if row["broker_order_state"] else None,
+            broker_client_order_id=str(row["broker_client_order_id"]) if row["broker_client_order_id"] else None,
+            broker_filled_qty=int(row["broker_filled_qty"]) if row["broker_filled_qty"] is not None else None,
+            broker_filled_avg_price=float(row["broker_filled_avg_price"]) if row["broker_filled_avg_price"] is not None else None,
+            broker_updated_at=datetime.fromisoformat(str(row["broker_updated_at"])) if row["broker_updated_at"] else None,
             close_reason=str(row["close_reason"]) if row["close_reason"] else None,
             max_price_seen=float(row["max_price_seen"] if row["max_price_seen"] is not None else row["entry_price"]),
         )

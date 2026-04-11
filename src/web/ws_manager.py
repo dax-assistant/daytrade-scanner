@@ -7,6 +7,8 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Set
 
 from fastapi import WebSocket
 
+from src.audit import websocket_actor
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -191,15 +193,52 @@ class WebSocketManager:
 
         if action == "close_trade":
             trade_id = int(message.get("trade_id"))
+            trade_record = await simulator.db.get_trade_by_id(trade_id)
+            if not trade_record or trade_record.status != "open":
+                await self._audit(ws, "ws_trade_close_requested", "failure", {"trade_id": trade_id, "error": "trade_not_open"})
+                return {"ok": False, "error": "trade_not_open", "trade_id": trade_id}
+
+            current_price = await simulator._resolve_exit_market_price(trade_record)
+            if simulator._use_alpaca_orders:
+                blocked_reason = simulator.preview_broker_market_order(
+                    symbol=trade_record.ticker,
+                    qty=trade_record.quantity,
+                    side="sell",
+                    source="closed_manual",
+                    estimated_price=current_price,
+                )
+                if blocked_reason:
+                    await self._audit(ws, "ws_trade_close_requested", "blocked", {"trade_id": trade_id, "ticker": trade_record.ticker, "reason": blocked_reason})
+                    return {"ok": False, "error": blocked_reason, "trade_id": trade_id}
+
             trade = await simulator.close_trade_by_id(trade_id)
-            return {"ok": trade is not None, "trade_id": trade_id}
+            await self._audit(ws, "ws_trade_close_requested", "success" if trade else "failure", {"trade_id": trade_id, "ticker": trade_record.ticker})
+            return {"ok": trade is not None, "trade_id": trade_id, "error": None if trade else "trade_not_closed"}
+
+        if action == "reconcile_trade":
+            trade_id = int(message.get("trade_id"))
+            result = await simulator.reconcile_now(trade_id=trade_id)
+            await self._audit(ws, "ws_trade_reconcile_requested", "success" if result.get("ok") else "failure", {"trade_id": trade_id, "error": result.get("error")})
+            return result
+
+        if action == "reconcile_now":
+            result = await simulator.reconcile_now()
+            await self._audit(ws, "ws_simulator_reconcile_requested", "success" if result.get("ok") else "failure", {"scope": result.get("scope"), "error": result.get("error")})
+            return result
 
         if action == "change_profile":
             profile = str(message.get("profile") or "moderate")
             result = await simulator.change_profile(profile)
+            await self._audit(ws, "ws_profile_changed", "success", {"profile": profile})
             return {"ok": True, **result}
 
         return {"ok": False, "error": "unknown_action"}
+
+    async def _audit(self, ws: WebSocket, event: str, status: str, details: Dict[str, Any]) -> None:
+        audit_logger = getattr(ws.app.state, "audit_logger", None)
+        if audit_logger is None:
+            return
+        await audit_logger.log(event, {"status": status, "actor": websocket_actor(ws), "details": details})
 
     @staticmethod
     def _serialize(data: Any) -> Any:
