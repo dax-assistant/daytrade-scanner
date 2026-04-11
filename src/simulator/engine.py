@@ -358,6 +358,151 @@ class PaperTradingSimulator:
         self._trading_policy.assert_order_allowed(intent)
         return await self.alpaca_client.submit_market_order(symbol=symbol, qty=qty, side=side)
 
+    @staticmethod
+    def _trade_expects_broker_native_protection(trade: Trade) -> bool:
+        return (trade.broker_protection_type or "").lower() in {"bracket", "oto"}
+
+    @staticmethod
+    def _profile_requests_protection(profile: RiskProfile) -> bool:
+        return (
+            float(profile.stop_loss_pct) > 0
+            or float(profile.take_profit_pct) > 0
+            or (bool(profile.trailing_stop) and float(profile.trailing_stop_pct) > 0)
+        )
+
+    @staticmethod
+    def _profile_supports_broker_native_protection(profile: RiskProfile) -> bool:
+        return float(profile.stop_loss_pct) > 0 and not bool(profile.trailing_stop)
+
+    def _broker_protection_request_for_profile(self, profile: RiskProfile) -> tuple[Optional[str], Optional[str]]:
+        if not self._profile_requests_protection(profile):
+            return None, None
+        if not self._profile_supports_broker_native_protection(profile):
+            if profile.trailing_stop and profile.trailing_stop_pct > 0:
+                return None, "broker_native_protection_does_not_support_trailing_stop"
+            if profile.stop_loss_pct <= 0:
+                return None, "broker_native_protection_requires_stop_loss"
+            return None, "broker_native_protection_unavailable"
+        return ("bracket" if profile.take_profit_pct > 0 else "oto"), None
+
+    async def _submit_broker_entry_order(
+        self,
+        *,
+        symbol: str,
+        qty: int,
+        source: str,
+        estimated_price: float,
+        stop_loss: float,
+        take_profit: Optional[float],
+        protection_order_class: Optional[str],
+    ) -> Dict[str, Any]:
+        intent = self._build_order_intent(
+            symbol=symbol,
+            qty=qty,
+            side="buy",
+            source=source,
+            estimated_price=estimated_price,
+        )
+        self._trading_policy.assert_order_allowed(intent)
+        if protection_order_class in {"bracket", "oto"}:
+            return await self.alpaca_client.submit_protected_order(
+                symbol=symbol,
+                qty=qty,
+                stop_loss=self._normalize_broker_price(stop_loss) or stop_loss,
+                take_profit=self._normalize_broker_price(take_profit) if protection_order_class == "bracket" else None,
+            )
+        return await self.alpaca_client.submit_market_order(symbol=symbol, qty=qty, side="buy")
+
+    @staticmethod
+    def _normalize_broker_price(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        normalized = float(value)
+        decimals = 2 if normalized >= 1 else 4
+        return round(normalized, decimals)
+
+    @staticmethod
+    def _protection_leg_label(leg: Dict[str, Any]) -> str:
+        order_type = str(leg.get("type") or "").strip().lower()
+        if order_type.startswith("stop"):
+            return "stop"
+        if order_type == "limit":
+            return "target"
+        return order_type or "leg"
+
+    def _apply_broker_protection_to_trade(self, trade: Trade, order: Dict[str, Any]) -> None:
+        order_class = str(order.get("order_class") or trade.broker_protection_type or "").strip().lower()
+        if order_class not in {"bracket", "oto"}:
+            if self._trade_expects_broker_native_protection(trade):
+                state = trade.broker_order_state or "unknown"
+                if state in {"canceled", "expired", "rejected"}:
+                    trade.broker_protection_status = "inactive"
+                    trade.broker_protection_note = "Broker-native protection did not remain active."
+                else:
+                    trade.broker_protection_status = "expected"
+                    trade.broker_protection_note = "Broker-native protection requested; waiting for child orders."
+            else:
+                trade.broker_protection_type = None
+                trade.broker_protection_status = None
+                trade.broker_protection_note = None
+            return
+
+        trade.broker_protection_type = order_class
+        stop_loss_payload = order.get("stop_loss") if isinstance(order.get("stop_loss"), dict) else {}
+        take_profit_payload = order.get("take_profit") if isinstance(order.get("take_profit"), dict) else {}
+        stop_candidate = stop_loss_payload.get("stop_price")
+        take_profit_candidate = take_profit_payload.get("limit_price")
+        raw_legs = order.get("legs")
+        legs = [leg for leg in raw_legs if isinstance(leg, dict)] if isinstance(raw_legs, list) else []
+        open_states = {
+            "accepted",
+            "accepted_for_bidding",
+            "calculated",
+            "held",
+            "new",
+            "partially_filled",
+            "pending_new",
+        }
+        inactive_states = {"canceled", "done_for_day", "expired", "rejected"}
+
+        summaries: list[str] = []
+        leg_states: list[str] = []
+        for leg in legs:
+            label = self._protection_leg_label(leg)
+            leg_state = self.alpaca_client.normalize_order_state(leg)
+            summaries.append(f"{label}:{leg_state}")
+            leg_states.append(leg_state)
+            if label == "stop" and leg.get("stop_price") is not None:
+                stop_candidate = leg.get("stop_price")
+            if label == "target" and leg.get("limit_price") is not None:
+                take_profit_candidate = leg.get("limit_price")
+
+        if stop_candidate is not None:
+            trade.stop_loss = float(stop_candidate)
+        if take_profit_candidate is not None:
+            trade.take_profit = float(take_profit_candidate)
+
+        if not legs:
+            trade.broker_protection_status = "expected"
+            trade.broker_protection_note = "Broker-native protection requested; waiting for child orders."
+            return
+
+        if any(state == "filled" for state in leg_states):
+            trade.broker_protection_status = "triggered"
+            trade.broker_protection_note = f"Broker child leg filled; waiting for reconciliation ({', '.join(summaries)})."
+            return
+        if any(state in open_states for state in leg_states):
+            trade.broker_protection_status = "active"
+            trade.broker_protection_note = ", ".join(summaries)
+            return
+        if all(state in inactive_states for state in leg_states):
+            trade.broker_protection_status = "inactive"
+            trade.broker_protection_note = ", ".join(summaries)
+            return
+
+        trade.broker_protection_status = "partial_visibility"
+        trade.broker_protection_note = ", ".join(summaries)
+
     def _append_reconciliation_issue(self, issue: str) -> None:
         self._reconciliation_issues = (self._reconciliation_issues + [issue])[-20:]
 
@@ -386,6 +531,7 @@ class PaperTradingSimulator:
         broker_updated_raw = order.get("updated_at") or order.get("filled_at") or order.get("submitted_at")
         if broker_updated_raw:
             trade.broker_updated_at = datetime.fromisoformat(str(broker_updated_raw).replace("Z", "+00:00"))
+        self._apply_broker_protection_to_trade(trade, order)
 
     async def _finalize_trade_close(self, trade: Trade, exit_price: float, reason: str) -> None:
         trade.exit_price = float(exit_price)
@@ -411,12 +557,13 @@ class PaperTradingSimulator:
         if trade.broker_filled_avg_price:
             trade.entry_price = trade.broker_filled_avg_price
             profile = get_profile(self._profiles, trade.risk_profile)
-            trade.stop_loss = trade.entry_price * (1 - profile.stop_loss_pct / 100.0)
-            trade.take_profit = (
-                trade.entry_price * (1 + profile.take_profit_pct / 100.0)
-                if profile.take_profit_pct > 0
-                else None
-            )
+            if not self._trade_expects_broker_native_protection(trade):
+                trade.stop_loss = trade.entry_price * (1 - profile.stop_loss_pct / 100.0)
+                trade.take_profit = (
+                    trade.entry_price * (1 + profile.take_profit_pct / 100.0)
+                    if profile.take_profit_pct > 0
+                    else None
+                )
             trade.max_price_seen = trade.entry_price
         trade.status = "open"
         trade.close_reason = None
@@ -451,7 +598,10 @@ class PaperTradingSimulator:
         if not self._use_alpaca_orders or not trade.alpaca_order_id:
             return
         try:
-            order = await self.alpaca_client.get_order(trade.alpaca_order_id)
+            order = await self.alpaca_client.get_order(
+                trade.alpaca_order_id,
+                nested=self._trade_expects_broker_native_protection(trade),
+            )
         except Exception as exc:
             self._append_reconciliation_issue(f"broker_order_unavailable:{trade.ticker}:{exc}")
             return
@@ -509,6 +659,10 @@ class PaperTradingSimulator:
                         await self.db.update_trade(trade)
                 else:
                     await self.db.update_trade(trade)
+            return
+
+        if trade.status == "open":
+            await self.db.update_trade(trade)
 
     async def reconcile_now(self, trade_id: Optional[int] = None) -> Dict[str, Any]:
         if trade_id is None:
@@ -578,14 +732,26 @@ class PaperTradingSimulator:
         initial_order: Optional[Dict[str, Any]] = None
         alpaca_order_id: Optional[str] = None
         initial_status = "open"
+        protection_order_class, protection_block_reason = self._broker_protection_request_for_profile(profile)
+        if self._use_alpaca_orders and protection_block_reason:
+            LOGGER.warning("Execution blocked for %s buy order: %s", candidate.ticker, protection_block_reason)
+            self._append_reconciliation_issue(f"execution_blocked:{candidate.ticker}:{protection_block_reason}")
+            await self.event_bus.emit(
+                "execution_blocked",
+                {"ticker": candidate.ticker, "side": "buy", "reason": protection_block_reason, "source": source},
+            )
+            return None
+
         if self._use_alpaca_orders:
             try:
-                order = await self._submit_broker_market_order(
+                order = await self._submit_broker_entry_order(
                     symbol=candidate.ticker,
                     qty=quantity,
-                    side="buy",
                     source=source,
                     estimated_price=entry_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    protection_order_class=protection_order_class,
                 )
                 initial_order = order
                 alpaca_order_id = str(order.get("id") or "") or None
@@ -595,14 +761,15 @@ class PaperTradingSimulator:
                     initial_status = "pending_entry"
                 if filled_avg_price > 0:
                     entry_price = filled_avg_price
-                    stop_loss = entry_price * (1 - profile.stop_loss_pct / 100.0)
-                    take_profit = entry_price * (1 + profile.take_profit_pct / 100.0) if profile.take_profit_pct > 0 else None
+                    if protection_order_class is None:
+                        stop_loss = entry_price * (1 - profile.stop_loss_pct / 100.0)
+                        take_profit = entry_price * (1 + profile.take_profit_pct / 100.0) if profile.take_profit_pct > 0 else None
             except TradingPolicyError as exc:
                 LOGGER.warning("Execution blocked for %s buy order: %s", candidate.ticker, exc)
                 self._append_reconciliation_issue(f"execution_blocked:{candidate.ticker}:{exc}")
                 await self.event_bus.emit(
                     "execution_blocked",
-                    {"ticker": candidate.ticker, "side": "buy", "reason": str(exc), "source": "scanner_auto"},
+                    {"ticker": candidate.ticker, "side": "buy", "reason": str(exc), "source": source},
                 )
                 return None
             except Exception as exc:
@@ -633,6 +800,9 @@ class PaperTradingSimulator:
             broker_filled_qty=None,
             broker_filled_avg_price=None,
             broker_updated_at=None,
+            broker_protection_type=protection_order_class,
+            broker_protection_status=("expected" if protection_order_class else None),
+            broker_protection_note=("Broker-native protection requested; waiting for child orders." if protection_order_class else None),
             close_reason=None,
             max_price_seen=entry_price,
         )
@@ -668,19 +838,21 @@ class PaperTradingSimulator:
             await self.db.update_trade(trade)
             await self.event_bus.emit("trade_updated", trade)
 
-        if current_price <= trade.stop_loss:
-            await self._close_trade(trade, current_price, "closed_stop")
-            return
-
-        if trade.take_profit is not None and current_price >= trade.take_profit:
-            await self._close_trade(trade, current_price, "closed_target")
-            return
-
-        if trade.trailing_stop_pct and trade.trailing_stop_pct > 0:
-            trailing_stop_price = trade.max_price_seen * (1 - trade.trailing_stop_pct / 100.0)
-            if current_price <= trailing_stop_price:
-                await self._close_trade(trade, current_price, "closed_trailing")
+        # Avoid duplicate protective sells while the broker owns the stop/target legs.
+        if not self._trade_expects_broker_native_protection(trade):
+            if current_price <= trade.stop_loss:
+                await self._close_trade(trade, current_price, "closed_stop")
                 return
+
+            if trade.take_profit is not None and current_price >= trade.take_profit:
+                await self._close_trade(trade, current_price, "closed_target")
+                return
+
+            if trade.trailing_stop_pct and trade.trailing_stop_pct > 0:
+                trailing_stop_price = trade.max_price_seen * (1 - trade.trailing_stop_pct / 100.0)
+                if current_price <= trailing_stop_price:
+                    await self._close_trade(trade, current_price, "closed_trailing")
+                    return
 
         unrealized_pnl = (current_price - trade.entry_price) * trade.quantity
         await self.event_bus.emit(

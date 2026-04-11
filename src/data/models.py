@@ -115,6 +115,9 @@ class Trade:
     broker_filled_qty: Optional[int]
     broker_filled_avg_price: Optional[float]
     broker_updated_at: Optional[datetime]
+    broker_protection_type: Optional[str]
+    broker_protection_status: Optional[str]
+    broker_protection_note: Optional[str]
     close_reason: Optional[str]
     max_price_seen: float
 

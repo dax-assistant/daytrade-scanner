@@ -66,6 +66,9 @@ SCHEMA_STATEMENTS = [
         broker_filled_qty INTEGER,
         broker_filled_avg_price REAL,
         broker_updated_at TEXT,
+        broker_protection_type TEXT,
+        broker_protection_status TEXT,
+        broker_protection_note TEXT,
         close_reason TEXT,
         max_price_seen REAL,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -135,6 +138,9 @@ TRADE_COLUMN_MIGRATIONS = [
     ("broker_filled_qty", "ALTER TABLE trades ADD COLUMN broker_filled_qty INTEGER"),
     ("broker_filled_avg_price", "ALTER TABLE trades ADD COLUMN broker_filled_avg_price REAL"),
     ("broker_updated_at", "ALTER TABLE trades ADD COLUMN broker_updated_at TEXT"),
+    ("broker_protection_type", "ALTER TABLE trades ADD COLUMN broker_protection_type TEXT"),
+    ("broker_protection_status", "ALTER TABLE trades ADD COLUMN broker_protection_status TEXT"),
+    ("broker_protection_note", "ALTER TABLE trades ADD COLUMN broker_protection_note TEXT"),
 ]
 
 

@@ -681,6 +681,8 @@ function renderPositions(data, simStatus = {}) {
     const statusMeta = positionStatusMeta(t);
     const brokerFilled = t.broker_filled_qty != null ? `${t.broker_filled_qty} @ ${Number(t.broker_filled_avg_price || 0).toFixed(2)}` : '—';
     const brokerState = t.broker_order_state || '—';
+    const brokerProtection = t.broker_protection_type ? `${String(t.broker_protection_type).toUpperCase()} / ${t.broker_protection_status || 'unknown'}` : 'app-side';
+    const brokerProtectionNote = t.broker_protection_note || '—';
     const tr = document.createElement('tr');
     tr.className = t.status === 'reconciliation_hold' ? 'position-row-hold' : '';
     tr.innerHTML = `
@@ -699,6 +701,8 @@ function renderPositions(data, simStatus = {}) {
       <td>
         <div class="broker-meta">State: ${escapeHtml(brokerState)}</div>
         <div class="broker-meta">Filled: ${escapeHtml(brokerFilled)}</div>
+        <div class="broker-meta">Protection: ${escapeHtml(brokerProtection)}</div>
+        <div class="broker-meta">Protect note: ${escapeHtml(brokerProtectionNote)}</div>
         <div class="broker-meta">Updated: ${escapeHtml(fmtTimeET(t.broker_updated_at))}</div>
       </td>
       <td>${t.status === 'reconciliation_hold' ? `<button class="reconcile-btn" data-reconcile-tradeid="${t.id}">Reconcile</button>` : '<span class="muted">—</span>'}</td>

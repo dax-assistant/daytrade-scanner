@@ -18,11 +18,22 @@ class FakeAlpacaClient:
         self.latest_price = latest_price
         self.positions = list(positions or [])
         self.account = dict(account or {})
+        self.market_submissions = []
+        self.protected_submissions = []
+        self.get_order_calls = []
 
     async def submit_market_order(self, symbol: str, qty: int, side: str = "buy"):
+        self.market_submissions.append({"symbol": symbol, "qty": qty, "side": side})
         return self.submit_orders.pop(0)
 
-    async def get_order(self, order_id: str):
+    async def submit_protected_order(self, *, symbol: str, qty: int, stop_loss: float, take_profit=None):
+        self.protected_submissions.append(
+            {"symbol": symbol, "qty": qty, "stop_loss": stop_loss, "take_profit": take_profit}
+        )
+        return self.submit_orders.pop(0)
+
+    async def get_order(self, order_id: str, *, nested: bool = False):
+        self.get_order_calls.append({"order_id": order_id, "nested": nested})
         return self.fetched_orders.pop(0)
 
     async def get_latest_trade_price(self, symbol: str):
@@ -135,6 +146,94 @@ class OrderReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored.broker_order_state, "filled")
         self.assertAlmostEqual(stored.entry_price, 10.25)
         self.assertIn(("trade_opened", "AAPL", "open"), self.events)
+
+    async def test_protected_entry_uses_broker_native_bracket_submission(self):
+        sim = self.make_sim(
+            submit_orders=[
+                {
+                    "id": "entry-protected",
+                    "status": "new",
+                    "filled_qty": "0",
+                    "client_order_id": "entry-protected",
+                    "order_class": "bracket",
+                    "stop_loss": {"stop_price": "9.51"},
+                    "take_profit": {"limit_price": "11.01"},
+                    "submitted_at": "2026-04-10T23:00:00Z",
+                }
+            ],
+            fetched_orders=[],
+        )
+
+        trade = await sim._enter_trade(self.make_candidate("AAPL"), source="test")
+
+        self.assertEqual(trade.status, "pending_entry")
+        self.assertEqual(len(sim.alpaca_client.protected_submissions), 1)
+        self.assertEqual(len(sim.alpaca_client.market_submissions), 0)
+        submission = sim.alpaca_client.protected_submissions[0]
+        self.assertEqual(submission["symbol"], "AAPL")
+        self.assertAlmostEqual(submission["stop_loss"], trade.stop_loss)
+        self.assertAlmostEqual(submission["take_profit"], trade.take_profit)
+        self.assertEqual(trade.broker_protection_type, "bracket")
+        self.assertEqual(trade.broker_protection_status, "expected")
+        self.assertIn("waiting for child orders", trade.broker_protection_note.lower())
+
+    async def test_open_trade_reconciliation_tracks_active_broker_protection_without_forcing_close(self):
+        sim = self.make_sim(
+            submit_orders=[
+                {
+                    "id": "entry-bracket-open",
+                    "status": "filled",
+                    "filled_qty": "100",
+                    "filled_avg_price": "10.00",
+                    "client_order_id": "entry-bracket-open",
+                    "order_class": "bracket",
+                    "stop_loss": {"stop_price": "9.70"},
+                    "take_profit": {"limit_price": "10.50"},
+                    "updated_at": "2026-04-10T23:00:00Z",
+                }
+            ],
+            fetched_orders=[
+                {
+                    "id": "entry-bracket-open",
+                    "status": "filled",
+                    "filled_qty": "100",
+                    "filled_avg_price": "10.00",
+                    "client_order_id": "entry-bracket-open",
+                    "order_class": "bracket",
+                    "stop_loss": {"stop_price": "9.70"},
+                    "take_profit": {"limit_price": "10.50"},
+                    "legs": [
+                        {"id": "tp-1", "type": "limit", "status": "new", "limit_price": "10.50"},
+                        {"id": "sl-1", "type": "stop", "status": "accepted", "stop_price": "9.70"},
+                    ],
+                    "updated_at": "2026-04-10T23:00:05Z",
+                }
+            ],
+        )
+
+        trade = await sim._enter_trade(self.make_candidate("QQQ"), source="test")
+        self.assertEqual(trade.status, "open")
+
+        await sim._reconcile_trade_order(trade)
+        stored = await self.db.get_trade_by_id(trade.id)
+
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.status, "open")
+        self.assertEqual(stored.broker_protection_status, "active")
+        self.assertIn("target:new", stored.broker_protection_note)
+        self.assertIn("stop:accepted", stored.broker_protection_note)
+        self.assertTrue(sim.alpaca_client.get_order_calls[0]["nested"])
+
+    async def test_trailing_stop_profile_fails_closed_for_broker_native_entry(self):
+        sim = self.make_sim(submit_orders=[], fetched_orders=[])
+        sim._active_profile_name = "aggressive"
+
+        trade = await sim._enter_trade(self.make_candidate("AMD"), source="test")
+
+        self.assertIsNone(trade)
+        self.assertEqual(len(sim.alpaca_client.protected_submissions), 0)
+        self.assertEqual(len(sim.alpaca_client.market_submissions), 0)
+        self.assertTrue(any("broker_native_protection_does_not_support_trailing_stop" in issue for issue in sim._reconciliation_issues))
 
     async def test_rejected_entry_fails_closed(self):
         sim = self.make_sim(

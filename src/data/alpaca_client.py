@@ -321,6 +321,12 @@ class AlpacaClient:
             )
         return out
 
+    @staticmethod
+    def _format_order_price(value: float) -> str:
+        price = round(float(value), 2 if float(value) >= 1 else 4)
+        decimals = 2 if price >= 1 else 4
+        return f"{price:.{decimals}f}"
+
     async def submit_market_order(self, symbol: str, qty: int, side: str = "buy") -> Dict[str, Any]:
         path = "/v2/orders"
         payload = {
@@ -333,9 +339,40 @@ class AlpacaClient:
         response = await self._post_json(self.get_active_trading_base_url(), path, payload)
         return response if isinstance(response, dict) else {}
 
-    async def get_order(self, order_id: str) -> Dict[str, Any]:
+    async def submit_protected_order(
+        self,
+        *,
+        symbol: str,
+        qty: int,
+        stop_loss: float,
+        take_profit: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        normalized_qty = max(1, int(qty))
+        normalized_stop = float(stop_loss)
+        normalized_take_profit = float(take_profit) if take_profit is not None else None
+        if normalized_stop <= 0:
+            raise ValueError("stop_loss must be > 0 for protected orders")
+
+        order_class = "bracket" if normalized_take_profit is not None else "oto"
+        payload: Dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "qty": str(normalized_qty),
+            "side": "buy",
+            "type": "market",
+            "time_in_force": "day",
+            "order_class": order_class,
+            "stop_loss": {"stop_price": self._format_order_price(normalized_stop)},
+        }
+        if normalized_take_profit is not None:
+            payload["take_profit"] = {"limit_price": self._format_order_price(normalized_take_profit)}
+
+        response = await self._post_json(self.get_active_trading_base_url(), "/v2/orders", payload)
+        return response if isinstance(response, dict) else {}
+
+    async def get_order(self, order_id: str, *, nested: bool = False) -> Dict[str, Any]:
         path = f"/v2/orders/{order_id}"
-        response = await self._request_json(self.get_active_trading_base_url(), path)
+        params = {"nested": "true"} if nested else None
+        response = await self._request_json(self.get_active_trading_base_url(), path, params=params)
         return response if isinstance(response, dict) else {}
 
     @staticmethod

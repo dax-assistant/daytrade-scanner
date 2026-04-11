@@ -126,8 +126,9 @@ class DatabaseManager:
                     exit_price, exit_time, stop_loss, take_profit, trailing_stop_pct,
                     quantity, status, pnl, pnl_percent, alpaca_order_id, broker_order_state,
                     broker_client_order_id, broker_filled_qty, broker_filled_avg_price, broker_updated_at,
+                    broker_protection_type, broker_protection_status, broker_protection_note,
                     close_reason, max_price_seen, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trade.scanner_hit_id,
@@ -151,6 +152,9 @@ class DatabaseManager:
                     trade.broker_filled_qty,
                     trade.broker_filled_avg_price,
                     trade.broker_updated_at.isoformat() if trade.broker_updated_at else None,
+                    trade.broker_protection_type,
+                    trade.broker_protection_status,
+                    trade.broker_protection_note,
                     trade.close_reason,
                     trade.max_price_seen,
                     datetime.now(timezone.utc).isoformat(),
@@ -171,6 +175,7 @@ class DatabaseManager:
                     trailing_stop_pct = ?, quantity = ?, status = ?, pnl = ?, pnl_percent = ?,
                     alpaca_order_id = ?, broker_order_state = ?, broker_client_order_id = ?,
                     broker_filled_qty = ?, broker_filled_avg_price = ?, broker_updated_at = ?,
+                    broker_protection_type = ?, broker_protection_status = ?, broker_protection_note = ?,
                     close_reason = ?, max_price_seen = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -191,6 +196,9 @@ class DatabaseManager:
                     trade.broker_filled_qty,
                     trade.broker_filled_avg_price,
                     trade.broker_updated_at.isoformat() if trade.broker_updated_at else None,
+                    trade.broker_protection_type,
+                    trade.broker_protection_status,
+                    trade.broker_protection_note,
                     trade.close_reason,
                     trade.max_price_seen,
                     datetime.now(timezone.utc).isoformat(),
@@ -815,6 +823,9 @@ class DatabaseManager:
             broker_filled_qty=int(row["broker_filled_qty"]) if row["broker_filled_qty"] is not None else None,
             broker_filled_avg_price=float(row["broker_filled_avg_price"]) if row["broker_filled_avg_price"] is not None else None,
             broker_updated_at=datetime.fromisoformat(str(row["broker_updated_at"])) if row["broker_updated_at"] else None,
+            broker_protection_type=str(row["broker_protection_type"]) if row["broker_protection_type"] else None,
+            broker_protection_status=str(row["broker_protection_status"]) if row["broker_protection_status"] else None,
+            broker_protection_note=str(row["broker_protection_note"]) if row["broker_protection_note"] else None,
             close_reason=str(row["close_reason"]) if row["close_reason"] else None,
             max_price_seen=float(row["max_price_seen"] if row["max_price_seen"] is not None else row["entry_price"]),
         )
