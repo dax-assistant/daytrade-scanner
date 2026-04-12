@@ -17,6 +17,7 @@ const GLOSSARY = {
 const els = {
   scannerState: document.getElementById('scannerState'),
   sessionBadge: document.getElementById('sessionBadge'),
+  environmentBadge: document.getElementById('environmentBadge'),
   tradingModeBadge: document.getElementById('tradingModeBadge'),
   executionStatusBadge: document.getElementById('executionStatusBadge'),
   guardReasonText: document.getElementById('guardReasonText'),
@@ -96,6 +97,16 @@ const els = {
   reconciliationLastRun: document.getElementById('reconciliationLastRun'),
   reconciliationIssues: document.getElementById('reconciliationIssues'),
   reconcileAllBtn: document.getElementById('reconcileAllBtn'),
+  brokerOrdersBody: document.getElementById('brokerOrdersBody'),
+  brokerOrdersEmpty: document.getElementById('brokerOrdersEmpty'),
+  devControlsPanel: document.getElementById('devControlsPanel'),
+  devInjectTradeBtn: document.getElementById('devInjectTradeBtn'),
+  devReconcileBtn: document.getElementById('devReconcileBtn'),
+  devControlsStatus: document.getElementById('devControlsStatus'),
+  brokerOrderModal: document.getElementById('brokerOrderModal'),
+  brokerOrderModalClose: document.getElementById('brokerOrderModalClose'),
+  brokerOrderSummary: document.getElementById('brokerOrderSummary'),
+  brokerOrderJson: document.getElementById('brokerOrderJson'),
 };
 
 const state = {
@@ -267,6 +278,14 @@ function applyTradingStatus(status) {
   const mode = String(status?.mode || 'paper').toLowerCase();
   const allowed = Boolean(status?.execution_allowed);
   const reason = prettifyGuardReason(status?.guard_reason || 'unknown');
+  const env = String(status?.environment || 'unknown').toUpperCase();
+  const envRole = String(status?.environment_role || '').toLowerCase();
+
+  if (els.environmentBadge) {
+    els.environmentBadge.textContent = envRole ? `${env} / ${envRole}`.toUpperCase() : env;
+    const envClass = envRole === 'production' ? 'pill-red' : envRole === 'preproduction' ? 'pill-yellow' : 'pill-blue';
+    els.environmentBadge.className = 'pill ' + envClass;
+  }
 
   if (els.tradingModeBadge) {
     els.tradingModeBadge.textContent = mode === 'live' ? 'LIVE MODE' : 'PAPER MODE';
@@ -279,7 +298,8 @@ function applyTradingStatus(status) {
   }
 
   if (els.guardReasonText) {
-    els.guardReasonText.textContent = `Guard: ${reason}`;
+    const brokerHealth = status?.broker_health?.ok === false ? ` | Broker: ${status?.broker_health?.detail || 'down'}` : '';
+    els.guardReasonText.textContent = `Guard: ${reason}${brokerHealth}`;
   }
 
   const blocked = !allowed;
@@ -669,8 +689,17 @@ function renderReconciliationBanner(items, simStatus) {
     .join('');
 }
 
-function renderPositions(data, simStatus = {}) {
+function renderPositions(data, simStatus = {}, brokerPositions = [], brokerOpenOrders = []) {
   const items = data.items || [];
+  const brokerPositionBySymbol = new Map((brokerPositions || []).map(item => [String(item.symbol || '').toUpperCase(), item]));
+  const brokerOrdersBySymbol = new Map();
+  (brokerOpenOrders || []).forEach(order => {
+    const symbol = String(order.symbol || '').toUpperCase();
+    if (!symbol) return;
+    const current = brokerOrdersBySymbol.get(symbol) || [];
+    current.push(order);
+    brokerOrdersBySymbol.set(symbol, current);
+  });
   els.positionsBody.innerHTML = '';
   renderReconciliationBanner(items, simStatus);
   items.forEach(t => {
@@ -683,6 +712,11 @@ function renderPositions(data, simStatus = {}) {
     const brokerState = t.broker_order_state || '—';
     const brokerProtection = t.broker_protection_type ? `${String(t.broker_protection_type).toUpperCase()} / ${t.broker_protection_status || 'unknown'}` : 'app-side';
     const brokerProtectionNote = t.broker_protection_note || '—';
+    const brokerSymbol = String(t.ticker || '').toUpperCase();
+    const brokerPosition = brokerPositionBySymbol.get(brokerSymbol);
+    const brokerOrders = brokerOrdersBySymbol.get(brokerSymbol) || [];
+    const brokerQty = brokerPosition ? Number(brokerPosition.qty || 0) : null;
+    const brokerOrderSummary = brokerOrders.length > 0 ? `${brokerOrders.length} open order${brokerOrders.length === 1 ? '' : 's'}` : 'no open orders';
     const tr = document.createElement('tr');
     tr.className = t.status === 'reconciliation_hold' ? 'position-row-hold' : '';
     tr.innerHTML = `
@@ -703,6 +737,8 @@ function renderPositions(data, simStatus = {}) {
         <div class="broker-meta">Filled: ${escapeHtml(brokerFilled)}</div>
         <div class="broker-meta">Protection: ${escapeHtml(brokerProtection)}</div>
         <div class="broker-meta">Protect note: ${escapeHtml(brokerProtectionNote)}</div>
+        <div class="broker-meta">Broker qty: ${escapeHtml(brokerQty == null ? '—' : String(brokerQty))}</div>
+        <div class="broker-meta">Open orders: ${escapeHtml(brokerOrderSummary)}</div>
         <div class="broker-meta">Updated: ${escapeHtml(fmtTimeET(t.broker_updated_at))}</div>
       </td>
       <td>${t.status === 'reconciliation_hold' ? `<button class="reconcile-btn" data-reconcile-tradeid="${t.id}">Reconcile</button>` : '<span class="muted">—</span>'}</td>
@@ -713,8 +749,74 @@ function renderPositions(data, simStatus = {}) {
     btn.onclick = () => triggerBrokerReconcile(Number(btn.dataset.reconcileTradeid), btn);
   });
   els.openCount.textContent = items.length;
+  els.openCount.title = `Broker positions: ${brokerPositions.length}`;
   els.accountBalance.textContent = fmtMoney(data.current_balance || 0);
   els.dailyPnl.textContent = fmtMoney(data.daily_pnl || 0);
+}
+
+function openBrokerOrderModal(order = {}) {
+  if (!els.brokerOrderModal || !els.brokerOrderJson || !els.brokerOrderSummary) return;
+  const orderId = String(order.order_id || order.id || '—');
+  const symbol = String(order.symbol || '—');
+  const status = String(order.status || 'unknown');
+  els.brokerOrderSummary.textContent = `${symbol} • ${status} • ${orderId}`;
+  els.brokerOrderJson.textContent = JSON.stringify(order, null, 2);
+  els.brokerOrderModal.classList.add('active');
+}
+
+function closeBrokerOrderModal() {
+  if (els.brokerOrderModal) els.brokerOrderModal.classList.remove('active');
+}
+
+function renderBrokerOrders(orders = [], tradingStatus = {}) {
+  if (!els.brokerOrdersBody || !els.brokerOrdersEmpty) return;
+  els.brokerOrdersBody.innerHTML = '';
+  els.brokerOrdersEmpty.classList.toggle('hidden', orders.length > 0);
+  orders.forEach(order => {
+    const tr = document.createElement('tr');
+    const orderId = String(order.order_id || order.id || '');
+    const canCancel = Boolean(orderId) && String(order.status || '').toLowerCase() !== 'filled';
+    tr.innerHTML = `
+      <td><div>${escapeHtml(orderId || '—')}</div><div class="muted">${escapeHtml(fmtTimeET(order.updated_at || order.submitted_at))}</div></td>
+      <td>${escapeHtml(order.symbol || '—')}</td>
+      <td>${escapeHtml(order.status || 'unknown')}</td>
+      <td>${escapeHtml(String(order.qty || 0))}<div class="muted">Filled ${escapeHtml(String(order.filled_qty || 0))}</div></td>
+      <td>
+        <button class="reconcile-btn" data-view-broker-order="${escapeHtml(orderId)}">Details</button>
+        <button class="reconcile-btn" data-cancel-broker-order="${escapeHtml(orderId)}" ${canCancel ? '' : 'disabled'}>Cancel</button>
+      </td>
+    `;
+    els.brokerOrdersBody.appendChild(tr);
+  });
+  document.querySelectorAll('[data-view-broker-order]').forEach(btn => {
+    btn.onclick = async () => {
+      const orderId = btn.dataset.viewBrokerOrder;
+      const response = await apiJson(`/api/broker/orders/${encodeURIComponent(orderId)}`, { order: {} });
+      if (!response.order || Object.keys(response.order).length === 0) {
+        alertLine(`Broker order ${orderId} not found.`);
+        return;
+      }
+      openBrokerOrderModal(response.order);
+    };
+  });
+  document.querySelectorAll('[data-cancel-broker-order]').forEach(btn => {
+    btn.onclick = async () => {
+      const orderId = btn.dataset.cancelBrokerOrder;
+      if (!window.confirm(`Cancel broker order ${orderId}?`)) return;
+      btn.disabled = true;
+      const result = await apiJson(`/api/broker/orders/${encodeURIComponent(orderId)}/cancel`, {}, { method: 'POST' });
+      alertLine(result.ok ? `Canceled broker order ${orderId}.` : `Cancel failed for ${orderId}: ${result.error || 'unknown error'}`);
+      await refreshData();
+    };
+  });
+}
+
+function renderDevControls(tradingStatus = {}) {
+  const envRole = String(tradingStatus.environment_role || '').toLowerCase();
+  const isDev = envRole === 'development';
+  if (els.devControlsPanel) els.devControlsPanel.classList.toggle('hidden', !isDev);
+  if (!isDev) return;
+  if (els.devControlsStatus) els.devControlsStatus.textContent = 'Inject synthetic trades or force reconcile in development.';
 }
 
 function renderHistory(data) {
@@ -1085,7 +1187,7 @@ function renderTradeLog() {
 
 async function refreshData() {
   if (state.auth.enabled && !state.auth.authenticated) return;
-  const [watchlist, scannerStatus, positions, history, simStatus, tradingStatus, alltime, journalAll, analytics, gradeAnalytics, allTrades] = await Promise.all([
+  const [watchlist, scannerStatus, positions, history, simStatus, tradingStatus, alltime, journalAll, analytics, gradeAnalytics, allTrades, brokerAccount, brokerPositions, brokerOpenOrders] = await Promise.all([
     apiJson('/api/scanner/watchlist', { items: [] }),
     apiJson('/api/scanner/status', {}),
     apiJson('/api/simulator/positions', { items: [] }),
@@ -1097,6 +1199,9 @@ async function refreshData() {
     apiJson(`/api/analytics/summary?range=${encodeURIComponent(state.analyticsRange)}`, {}),
     apiJson(`/api/analytics/grades?range=${encodeURIComponent(state.analyticsRange)}`, { items: [] }),
     apiJson('/api/trades?limit=100000', { items: [] }),
+    apiJson('/api/broker/account', { account: {} }),
+    apiJson('/api/broker/positions', { items: [] }),
+    apiJson('/api/broker/orders/open', { items: [] }),
   ]);
 
   journalEntryMap = {};
@@ -1116,12 +1221,22 @@ async function refreshData() {
   updatePrimaryCountdown(scannerStatus.primary_window);
   applyTradingStatus(tradingStatus);
 
-  renderPositions(positions, simStatus);
+  renderPositions(positions, simStatus, brokerPositions.items || [], brokerOpenOrders.items || []);
+  renderBrokerOrders(brokerOpenOrders.items || [], tradingStatus);
+  renderDevControls(tradingStatus);
   renderHistory(history);
   renderTradeLog();
   updateLossMeter(simStatus);
   renderAlltimePnl(alltime);
   renderAnalytics(analytics, state.gradeAnalytics);
+
+  const brokerAccountSnapshot = brokerAccount.account || {};
+  if (brokerAccountSnapshot && Object.keys(brokerAccountSnapshot).length > 0) {
+    els.accountBalance.textContent = fmtMoney(brokerAccountSnapshot.portfolio_value || brokerAccountSnapshot.equity || 0);
+    els.accountBalance.title = `Broker cash ${fmtMoney(brokerAccountSnapshot.cash || 0)} | Settled ${fmtMoney(brokerAccountSnapshot.settled_cash || 0)}`;
+  } else {
+    els.accountBalance.title = '';
+  }
 
   if (!selectedSymbol && watchlistItems.length) selectSymbol(watchlistItems[0].ticker);
   else syncChartTradeForm();
@@ -1356,6 +1471,28 @@ function initPositionCalculator() {
   calcPositionSize();
 }
 
+async function injectSyntheticTrade() {
+  const ticker = (window.prompt('Ticker to inject?', 'AMD') || '').trim().toUpperCase();
+  if (!ticker) return;
+  const quantity = Number(window.prompt('Quantity?', '10') || 10);
+  const entryPrice = Number(window.prompt('Entry price?', '10') || 10);
+  const status = (window.prompt('Status?', 'open') || 'open').trim();
+  const payload = { ticker, quantity, entry_price: entryPrice, status };
+  const result = await apiJson('/api/dev/inject/trade', {}, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  alertLine(result.ok ? `Injected synthetic trade for ${ticker}.` : `Injection failed: ${result.error || 'unknown error'}`);
+  await refreshData();
+}
+
+async function triggerDevReconcile() {
+  const result = await apiJson('/api/dev/reconcile', {}, { method: 'POST' });
+  alertLine(result.ok ? 'Development reconcile completed.' : `Development reconcile failed: ${result.error || 'unknown error'}`);
+  await refreshData();
+}
+
 function initAuth() {
   if (els.authForm) {
     els.authForm.addEventListener('submit', async (event) => {
@@ -1383,6 +1520,12 @@ async function init() {
   initPositionCalculator();
   initChartTradeForm();
   if (els.reconcileAllBtn) els.reconcileAllBtn.onclick = () => triggerBrokerReconcile(null, els.reconcileAllBtn);
+  if (els.devInjectTradeBtn) els.devInjectTradeBtn.onclick = () => injectSyntheticTrade();
+  if (els.devReconcileBtn) els.devReconcileBtn.onclick = () => triggerDevReconcile();
+  if (els.brokerOrderModalClose) els.brokerOrderModalClose.onclick = () => closeBrokerOrderModal();
+  if (els.brokerOrderModal) els.brokerOrderModal.addEventListener('click', (event) => {
+    if (event.target === els.brokerOrderModal) closeBrokerOrderModal();
+  });
   initViewTabs();
   initAnalyticsControls();
   initAuth();

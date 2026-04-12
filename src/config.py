@@ -198,8 +198,29 @@ class TradingConfig:
 
 
 @dataclass(frozen=True)
+class RiskConfig:
+    account_mode: str = "cash"
+    enforce_settled_cash: bool = True
+    max_notional_per_order: float = 500.0
+    max_open_positions: int = 3
+    max_daily_loss: float = 500.0
+    max_trades_per_day: int = 10
+    allow_extended_hours: bool = False
+    require_manual_approval_for_live_entries: bool = True
+
+
+@dataclass(frozen=True)
+class FeaturesConfig:
+    enable_trade_injection: bool = False
+    enable_debug_routes: bool = False
+    enable_manual_entry: bool = True
+    enable_emergency_stop: bool = True
+
+
+@dataclass(frozen=True)
 class Settings:
     environment: str
+    environment_role: str
     timezone: str
     alpaca: AlpacaConfig
     finnhub: FinnhubConfig
@@ -214,6 +235,8 @@ class Settings:
     risk_profiles: Dict[str, RiskProfileConfig]
     database: DatabaseConfig
     trading: TradingConfig
+    risk: RiskConfig
+    features: FeaturesConfig
 
 
 def _req(d: Dict[str, Any], key: str) -> Any:
@@ -399,10 +422,48 @@ def load_settings(config_path: str | Path) -> Settings:
         live=TradingLiveConfig(**(trading_raw.get("live", {}) or {})),
     )
 
+    environment_raw = raw.get("environment", "paper")
+    if isinstance(environment_raw, dict):
+        environment_name = str(environment_raw.get("name", "paper"))
+        environment_role = str(environment_raw.get("role", "development"))
+    else:
+        environment_name = str(environment_raw)
+        role_map = {
+            "dev": "development",
+            "development": "development",
+            "uat": "preproduction",
+            "paper": "preproduction",
+            "prod": "production",
+            "production": "production",
+            "live": "production",
+        }
+        environment_role = role_map.get(environment_name.strip().lower(), "development")
+
+    risk_raw = raw.get("risk", {}) or {}
+    risk_cfg = RiskConfig(
+        account_mode=str(risk_raw.get("account_mode", "cash")).strip().lower() or "cash",
+        enforce_settled_cash=bool(risk_raw.get("enforce_settled_cash", True)),
+        max_notional_per_order=float(risk_raw.get("max_notional_per_order", trading_cfg.live.max_notional_per_order)),
+        max_open_positions=int(risk_raw.get("max_open_positions", simulator_cfg.max_positions)),
+        max_daily_loss=float(risk_raw.get("max_daily_loss", simulator_cfg.max_daily_loss)),
+        max_trades_per_day=int(risk_raw.get("max_trades_per_day", 10)),
+        allow_extended_hours=bool(risk_raw.get("allow_extended_hours", False)),
+        require_manual_approval_for_live_entries=bool(risk_raw.get("require_manual_approval_for_live_entries", True)),
+    )
+
+    features_raw = raw.get("features", {}) or {}
+    features_cfg = FeaturesConfig(
+        enable_trade_injection=bool(features_raw.get("enable_trade_injection", False)),
+        enable_debug_routes=bool(features_raw.get("enable_debug_routes", False)),
+        enable_manual_entry=bool(features_raw.get("enable_manual_entry", True)),
+        enable_emergency_stop=bool(features_raw.get("enable_emergency_stop", True)),
+    )
+
     log_cfg = LoggingConfig(**logging_cfg)
 
     settings = Settings(
-        environment=str(raw.get("environment", "paper")),
+        environment=environment_name,
+        environment_role=environment_role,
         timezone=str(raw.get("timezone", "America/New_York")),
         alpaca=alpaca_cfg,
         finnhub=finnhub_cfg,
@@ -417,6 +478,8 @@ def load_settings(config_path: str | Path) -> Settings:
         risk_profiles=risk_profiles,
         database=database_cfg,
         trading=trading_cfg,
+        risk=risk_cfg,
+        features=features_cfg,
     )
 
     _validate_settings(settings)
@@ -449,6 +512,10 @@ def _validate_settings(settings: Settings) -> None:
         raise ValueError("simulator.reconciliation_position_mismatch_seconds must be >= simulator.reconcile_interval_seconds")
     if settings.database.path.strip() == "":
         raise ValueError("database.path is required")
+    if settings.environment.strip() == "":
+        raise ValueError("environment is required")
+    if settings.environment_role not in {"development", "preproduction", "production"}:
+        raise ValueError("environment.role must be development, preproduction, or production")
     if settings.finnhub.api_key.strip() == "":
         raise ValueError("api.finnhub.api_key is required")
     if settings.telegram_enabled and settings.telegram.bot_token.strip() == "":
@@ -469,6 +536,16 @@ def _validate_settings(settings: Settings) -> None:
         raise ValueError("trading.mode must be 'paper' or 'live'")
     if settings.trading.broker != "alpaca":
         raise ValueError("trading.broker must currently be 'alpaca'")
+    if settings.risk.account_mode not in {"cash", "margin"}:
+        raise ValueError("risk.account_mode must be 'cash' or 'margin'")
+    if settings.risk.max_notional_per_order <= 0:
+        raise ValueError("risk.max_notional_per_order must be > 0")
+    if settings.risk.max_open_positions < 1:
+        raise ValueError("risk.max_open_positions must be >= 1")
+    if settings.risk.max_daily_loss <= 0:
+        raise ValueError("risk.max_daily_loss must be > 0")
+    if settings.risk.max_trades_per_day < 1:
+        raise ValueError("risk.max_trades_per_day must be >= 1")
     if settings.alpaca.paper.trading_base_url.strip() == "":
         raise ValueError("api.alpaca.paper.trading_base_url is required")
     if settings.alpaca.paper.key_id.strip() == "":

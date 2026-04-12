@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from src.brokers.models import BrokerAccount, BrokerOrder, BrokerOrderSubmission, BrokerPosition
 from src.config import load_settings
 from src.data.models import StockCandidate
 from src.db.manager import DatabaseManager
@@ -60,6 +61,53 @@ class FakeAlpacaClient:
         return float(order.get("filled_avg_price") or 0.0)
 
 
+class FakeBrokerAdapter:
+    broker_name = "fake"
+
+    def __init__(self, *, submit_orders=None, fetched_orders=None, positions=None, account=None):
+        self.submit_orders = list(submit_orders or [])
+        self.fetched_orders = list(fetched_orders or [])
+        self.positions = list(positions or [])
+        self.account = account or BrokerAccount(account_id="acct-1", status="ACTIVE", account_mode="cash", cash=1000.0, settled_cash=1000.0, equity=1000.0, portfolio_value=1000.0)
+        self.entry_requests = []
+        self.exit_requests = []
+        self.get_order_calls = []
+
+    async def get_account(self):
+        return self.account
+
+    async def get_positions(self):
+        if self.positions and isinstance(self.positions[0], list):
+            return self.positions.pop(0)
+        return list(self.positions)
+
+    async def get_order(self, broker_order_id: str, *, nested: bool = False):
+        self.get_order_calls.append({"order_id": broker_order_id, "nested": nested})
+        return self.fetched_orders.pop(0)
+
+    async def list_open_orders(self):
+        return []
+
+    async def submit_market_entry(self, request):
+        self.entry_requests.append(request)
+        order = self.submit_orders.pop(0)
+        return BrokerOrderSubmission(accepted=True, order=order, raw={})
+
+    async def submit_market_exit(self, request):
+        self.exit_requests.append(request)
+        order = self.submit_orders.pop(0)
+        return BrokerOrderSubmission(accepted=True, order=order, raw={})
+
+    async def cancel_order(self, broker_order_id: str):
+        raise NotImplementedError
+
+    async def supports_bracket_orders(self):
+        return True
+
+    async def healthcheck(self):
+        raise NotImplementedError
+
+
 class OrderReconciliationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         os.environ.setdefault("ALPACA_PAPER_KEY_ID", "test-paper-key")
@@ -84,7 +132,7 @@ class OrderReconciliationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.tempdir.cleanup()
 
-    def make_sim(self, submit_orders, fetched_orders, latest_price=10.0, positions=None, account=None):
+    def make_sim(self, submit_orders, fetched_orders, latest_price=10.0, positions=None, account=None, broker_adapter=None):
         sim = PaperTradingSimulator(
             self.settings,
             self.event_bus,
@@ -97,6 +145,7 @@ class OrderReconciliationTests(unittest.IsolatedAsyncioTestCase):
                 positions=positions,
                 account=account,
             ),
+            broker_adapter=broker_adapter,
         )
         sim._use_alpaca_orders = True
         return sim
@@ -146,6 +195,76 @@ class OrderReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored.broker_order_state, "filled")
         self.assertAlmostEqual(stored.entry_price, 10.25)
         self.assertIn(("trade_opened", "AAPL", "open"), self.events)
+
+    async def test_adapter_normalized_order_reconciles_without_alpaca_raw_shape(self):
+        broker_adapter = FakeBrokerAdapter(
+            submit_orders=[
+                BrokerOrder(
+                    order_id="entry-adapter-1",
+                    symbol="AAPL",
+                    side="buy",
+                    qty=100,
+                    filled_qty=0,
+                    status="new",
+                    order_type="market",
+                    client_order_id="adapter-client-1",
+                    submitted_at="2026-04-10T23:00:00Z",
+                )
+            ],
+            fetched_orders=[
+                BrokerOrder(
+                    order_id="entry-adapter-1",
+                    symbol="AAPL",
+                    side="buy",
+                    qty=100,
+                    filled_qty=100,
+                    status="filled",
+                    order_type="market",
+                    client_order_id="adapter-client-1",
+                    filled_avg_price=10.25,
+                    updated_at="2026-04-10T23:00:05Z",
+                )
+            ],
+            positions=[[BrokerPosition(symbol="AAPL", qty=100, side="long")]],
+        )
+        sim = self.make_sim(submit_orders=[], fetched_orders=[], broker_adapter=broker_adapter)
+
+        trade = await sim._enter_trade(self.make_candidate("AAPL"), source="test")
+        self.assertEqual(trade.status, "pending_entry")
+        await sim._reconcile_trade_order(trade)
+
+        stored = await self.db.get_trade_by_id(trade.id)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.status, "open")
+        self.assertEqual(stored.quantity, 100)
+        self.assertEqual(stored.broker_order_state, "filled")
+        self.assertEqual(stored.alpaca_order_id, "entry-adapter-1")
+        self.assertEqual(stored.broker_client_order_id, "adapter-client-1")
+        self.assertAlmostEqual(stored.entry_price, 10.25)
+
+    async def test_inject_synthetic_trade_supports_stale_metadata(self):
+        sim = self.make_sim(submit_orders=[], fetched_orders=[])
+        result = await sim.inject_synthetic_trade(
+            {
+                "ticker": "PLTR",
+                "status": "pending_entry",
+                "entry_price": 25.0,
+                "quantity": 10,
+                "alpaca_order_id": "ord-stale-1",
+                "broker_order_state": "partially_filled",
+                "broker_filled_qty": 4,
+                "broker_filled_avg_price": 25.1,
+                "entry_age_seconds": 900,
+                "broker_updated_age_seconds": 600,
+            }
+        )
+
+        self.assertTrue(result["ok"])
+        trade = sim._open_trades["PLTR"]
+        self.assertEqual(trade.status, "pending_entry")
+        self.assertEqual(trade.broker_filled_qty, 4)
+        self.assertIsNotNone(trade.broker_updated_at)
+        self.assertGreaterEqual((trade.broker_updated_at - trade.entry_time).total_seconds(), 299)
 
     async def test_protected_entry_uses_broker_native_bracket_submission(self):
         sim = self.make_sim(

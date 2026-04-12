@@ -25,6 +25,7 @@ def create_app(
     scanner=None,
     config_path: Path | None = None,
     alpaca_client=None,
+    broker_adapter=None,
 ) -> FastAPI:
     app = FastAPI(title="Day Trade Scanner v3")
 
@@ -40,6 +41,7 @@ def create_app(
     app.state.static_dir = static_dir
     app.state.config_path = config_path
     app.state.alpaca_client = alpaca_client
+    app.state.broker_adapter = broker_adapter
     app.state.ws_auth_tokens = {}
     app.state.http_auth_tokens = {}
     app.state.audit_logger = AuditLogger(settings)

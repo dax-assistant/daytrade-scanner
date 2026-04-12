@@ -375,6 +375,40 @@ class AlpacaClient:
         response = await self._request_json(self.get_active_trading_base_url(), path, params=params)
         return response if isinstance(response, dict) else {}
 
+    async def list_orders(self, *, status: str = "open", limit: int = 100) -> List[Dict[str, Any]]:
+        response = await self._request_json(
+            self.get_active_trading_base_url(),
+            "/v2/orders",
+            params={"status": status, "limit": str(max(1, int(limit)))},
+        )
+        return response if isinstance(response, list) else []
+
+    async def cancel_order(self, order_id: str, max_attempts: int = 3) -> int:
+        if not self._session:
+            raise RuntimeError("AlpacaClient.start() must be called before requests")
+
+        url = f"{self.get_active_trading_base_url().rstrip('/')}/v2/orders/{order_id}"
+        for attempt in range(1, max_attempts + 1):
+            await self._rate_limiter.wait()
+            try:
+                async with self._session.delete(url, headers=self.get_active_trading_headers()) as resp:
+                    if resp.status == 429:
+                        retry_after = int(resp.headers.get("Retry-After", "2"))
+                        LOGGER.warning("Alpaca DELETE rate limited. Retrying in %ss", retry_after)
+                        await asyncio.sleep(retry_after)
+                        continue
+                    if resp.status >= 400:
+                        text = await resp.text()
+                        raise RuntimeError(f"Alpaca cancel failed {resp.status}: {text}")
+                    return int(resp.status)
+            except asyncio.TimeoutError:
+                if attempt == max_attempts:
+                    raise
+                LOGGER.warning("Alpaca DELETE timeout. Attempt %s/%s", attempt, max_attempts)
+                await asyncio.sleep(attempt)
+
+        raise RuntimeError(f"Failed Alpaca DELETE after {max_attempts} attempts: {url}")
+
     @staticmethod
     def normalize_order_state(order: Dict[str, Any]) -> str:
         return str(order.get("status") or "unknown").strip().lower() or "unknown"

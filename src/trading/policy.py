@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from src.config import Settings
-from src.trading.models import ExecutionGuardStatus, OrderIntent, TradingPolicyError
+from src.trading.models import ExecutionGuardStatus, OrderIntent, PolicyDecision, TradingPolicyError
 
 
 class TradingPolicy:
@@ -23,6 +23,11 @@ class TradingPolicy:
                 details={
                     "active_trading_base_url": self.settings.alpaca.paper.trading_base_url,
                     "live_enabled": False,
+                    "environment": self.settings.environment,
+                    "environment_role": self.settings.environment_role,
+                    "account_mode": self.settings.risk.account_mode,
+                    "enforce_settled_cash": self.settings.risk.enforce_settled_cash,
+                    "trade_injection_enabled": self.settings.features.enable_trade_injection,
                 },
             )
 
@@ -35,6 +40,11 @@ class TradingPolicy:
             "require_env_secrets": bool(live.require_env_secrets),
             "max_notional_per_order": float(live.max_notional_per_order),
             "max_position_size_pct": float(live.max_position_size_pct),
+            "environment": self.settings.environment,
+            "environment_role": self.settings.environment_role,
+            "account_mode": self.settings.risk.account_mode,
+            "enforce_settled_cash": self.settings.risk.enforce_settled_cash,
+            "manual_live_approval_required": self.settings.risk.require_manual_approval_for_live_entries,
         }
 
         if not live.enabled:
@@ -56,14 +66,37 @@ class TradingPolicy:
 
         return ExecutionGuardStatus(mode=mode, broker=broker, allowed=True, reason="execution_allowed", details=details)
 
-    def assert_order_allowed(self, intent: OrderIntent) -> None:
+    def evaluate_order_intent(self, intent: OrderIntent) -> PolicyDecision:
         status = self.get_guard_status()
         if not status.allowed:
-            raise TradingPolicyError(f"execution_blocked:{status.reason}")
+            return PolicyDecision(
+                allowed=False,
+                reason_code=status.reason,
+                user_message=f"execution blocked: {status.reason}",
+                audit_details={"guard_status": status.to_dict(), "intent": intent.to_dict()},
+            )
 
+        max_notional = float(self.settings.risk.max_notional_per_order)
         if status.mode == "live":
-            max_notional = float(self.settings.trading.live.max_notional_per_order)
+            max_notional = min(max_notional, float(self.settings.trading.live.max_notional_per_order))
             if intent.estimated_notional > max_notional:
-                raise TradingPolicyError(
-                    f"execution_blocked:max_notional_exceeded:{intent.estimated_notional:.2f}>{max_notional:.2f}"
+                return PolicyDecision(
+                    allowed=False,
+                    reason_code="max_notional_exceeded",
+                    user_message=f"estimated notional {intent.estimated_notional:.2f} exceeds cap {max_notional:.2f}",
+                    audit_details={"intent": intent.to_dict(), "max_notional_allowed": max_notional},
+                    max_notional_allowed=max_notional,
                 )
+
+        return PolicyDecision(
+            allowed=True,
+            reason_code="allowed",
+            user_message="order allowed",
+            audit_details={"intent": intent.to_dict(), "max_notional_allowed": max_notional},
+            max_notional_allowed=max_notional,
+        )
+
+    def assert_order_allowed(self, intent: OrderIntent) -> None:
+        decision = self.evaluate_order_intent(intent)
+        if not decision.allowed:
+            raise TradingPolicyError(f"execution_blocked:{decision.reason_code}")

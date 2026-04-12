@@ -52,6 +52,7 @@ h3 { margin: 0; font-size: 15px; }
 .pill-green { background: #14532d; color: #86efac; }
 .pill-yellow { background: #78350f; color: #fde68a; }
 .pill-red { background: #7f1d1d; color: #fca5a5; }
+.pill-blue { background: #172554; color: #93c5fd; }
 .pill-gray { background: #374151; color: #d1d5db; }
 
 .header-bar, .summary-bar {
@@ -144,7 +145,7 @@ h3 { margin: 0; font-size: 15px; }
 
 .trading-main-col {
   display: grid;
-  grid-template-rows: 150px auto minmax(280px, 1fr);
+  grid-template-rows: 150px auto 180px 90px minmax(280px, 1fr);
   gap: 10px;
   min-width: 0;
 }
@@ -223,6 +224,20 @@ h3 { margin: 0; font-size: 15px; }
 .trading-positions-panel {
   min-height: 80px;
   max-height: 200px;
+}
+
+.broker-orders-panel {
+  min-height: 140px;
+}
+
+.dev-controls-panel {
+  min-height: 70px;
+}
+
+.dev-controls-grid {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
 }
 
 .watchlist-panel .watchlist,
@@ -750,6 +765,19 @@ h3 { margin: 0; font-size: 15px; }
   font-size: 14px;
 }
 .save-journal-btn:hover { background: #1d4ed8; }
+.broker-order-json {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #cbd5e1;
+  max-height: 48vh;
+  overflow: auto;
+}
 .journal-btn {
   background: none;
   border: none;

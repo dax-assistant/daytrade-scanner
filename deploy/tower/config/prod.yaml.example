@@ -1,6 +1,6 @@
 environment:
-  name: uat
-  role: preproduction
+  name: prod
+  role: production
 timezone: America/New_York
 TELEGRAM_ENABLED: false
 api:
@@ -46,33 +46,31 @@ web:
   enabled: true
   host: 0.0.0.0
   port: 8081
-  cors_origins: ['http://localhost:8081']
+  cors_origins: ['http://10.1.1.235:8081']
   websocket_auth_enabled: true
   auth: { enabled: true, username: admin, password: ${WEB_AUTH_PASSWORD}, session_secret: ${WEB_AUTH_SESSION_SECRET} }
 simulator:
   enabled: true
   default_risk_profile: moderate
   account_size: 25000.0
-  max_positions: 3
-  max_daily_loss: 500.0
+  max_positions: 1
+  max_daily_loss: 100.0
   entry_delay_seconds: 5
   use_alpaca_orders: true
-  eod_summary_telegram: false
-  weekly_report_telegram: false
-  monthly_report_telegram: false
+  eod_summary_telegram: true
+  weekly_report_telegram: true
+  monthly_report_telegram: true
   simulated_slippage_bps: 10.0
   reconcile_interval_seconds: 30
 risk_profiles:
-  conservative: { position_size_pct: 2.0, stop_loss_pct: 3.0, take_profit_pct: 5.0, trailing_stop: false, trailing_stop_pct: 0.0, max_hold_minutes: 30 }
-  moderate: { position_size_pct: 5.0, stop_loss_pct: 5.0, take_profit_pct: 10.0, trailing_stop: false, trailing_stop_pct: 0.0, max_hold_minutes: 60 }
-  aggressive: { position_size_pct: 10.0, stop_loss_pct: 7.0, take_profit_pct: 0.0, trailing_stop: true, trailing_stop_pct: 5.0, max_hold_minutes: 120 }
+  conservative: { position_size_pct: 1.0, stop_loss_pct: 3.0, take_profit_pct: 5.0, trailing_stop: false, trailing_stop_pct: 0.0, max_hold_minutes: 30 }
+  moderate: { position_size_pct: 1.0, stop_loss_pct: 5.0, take_profit_pct: 10.0, trailing_stop: false, trailing_stop_pct: 0.0, max_hold_minutes: 60 }
+  aggressive: { position_size_pct: 1.0, stop_loss_pct: 7.0, take_profit_pct: 0.0, trailing_stop: true, trailing_stop_pct: 5.0, max_hold_minutes: 120 }
 database:
-  path: /app/data/scanner.db
+  path: /app/data/scanner-prod.db
 trading:
-  mode: paper
+  mode: live
   broker: alpaca
-  paper:
-    enabled: true
   live:
     enabled: false
     require_web_auth: true
@@ -80,16 +78,16 @@ trading:
     require_env_secrets: true
     require_explicit_confirmation_phrase: true
     confirmation_phrase: ENABLE LIVE TRADING
-    max_notional_per_order: 250.0
+    max_notional_per_order: 100.0
     max_position_size_pct: 1.0
 risk:
   account_mode: cash
   enforce_settled_cash: true
-  max_notional_per_order: 250.0
-  max_open_positions: 3
-  max_daily_loss: 500.0
-  max_trades_per_day: 10
-  allow_extended_hours: true
+  max_notional_per_order: 100.0
+  max_open_positions: 1
+  max_daily_loss: 100.0
+  max_trades_per_day: 3
+  allow_extended_hours: false
   require_manual_approval_for_live_entries: true
 features:
   enable_trade_injection: false

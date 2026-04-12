@@ -14,8 +14,8 @@ api:
       secret_key: ${ALPACA_PAPER_SECRET_KEY}
       trading_base_url: https://paper-api.alpaca.markets
     live:
-      key_id: ${ALPACA_LIVE_KEY_ID}
-      secret_key: ${ALPACA_LIVE_SECRET_KEY}
+      key_id: ""
+      secret_key: ""
       trading_base_url: https://api.alpaca.markets
   finnhub:
     api_key: ${FINNHUB_API_KEY}
@@ -46,7 +46,7 @@ web:
   enabled: true
   host: 0.0.0.0
   port: 8081
-  cors_origins: ['http://localhost:8081']
+  cors_origins: ['http://10.1.1.235:8083']
   websocket_auth_enabled: true
   auth: { enabled: true, username: admin, password: ${WEB_AUTH_PASSWORD}, session_secret: ${WEB_AUTH_SESSION_SECRET} }
 simulator:
@@ -67,19 +67,12 @@ risk_profiles:
   moderate: { position_size_pct: 5.0, stop_loss_pct: 5.0, take_profit_pct: 10.0, trailing_stop: false, trailing_stop_pct: 0.0, max_hold_minutes: 60 }
   aggressive: { position_size_pct: 10.0, stop_loss_pct: 7.0, take_profit_pct: 0.0, trailing_stop: true, trailing_stop_pct: 5.0, max_hold_minutes: 120 }
 database:
-  path: /app/data/scanner.db
+  path: /app/data/scanner-uat.db
 trading:
   mode: paper
   broker: alpaca
-  paper:
-    enabled: true
   live:
     enabled: false
-    require_web_auth: true
-    require_ws_auth: true
-    require_env_secrets: true
-    require_explicit_confirmation_phrase: true
-    confirmation_phrase: ENABLE LIVE TRADING
     max_notional_per_order: 250.0
     max_position_size_pct: 1.0
 risk:

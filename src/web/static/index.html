@@ -14,6 +14,7 @@
       <h1>⚡ Scanner Dashboard v3</h1>
       <span id="scannerState" class="pill pill-gray">connecting</span>
       <span id="sessionBadge" class="pill pill-gray">CLOSED</span>
+      <span id="environmentBadge" class="pill pill-gray">ENV --</span>
       <span id="tradingModeBadge" class="pill pill-yellow">PAPER MODE</span>
       <span id="executionStatusBadge" class="pill pill-green">EXECUTION OK</span>
       <span id="guardReasonText" class="muted">Guard: --</span>
@@ -86,6 +87,26 @@
             <tbody id="positionsBody"></tbody>
           </table>
         </div>
+      </div>
+
+      <div class="sidebar-section broker-orders-panel">
+        <div class="panel-title">Broker Open Orders</div>
+        <div id="brokerOrdersEmpty" class="muted">No open broker orders.</div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Order</th><th>Symbol</th><th>Status</th><th>Qty</th><th>Actions</th></tr></thead>
+            <tbody id="brokerOrdersBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="devControlsPanel" class="sidebar-section dev-controls-panel hidden">
+        <div class="panel-title">Dev Controls</div>
+        <div class="dev-controls-grid">
+          <button id="devInjectTradeBtn" class="icon-btn">Inject Synthetic Trade</button>
+          <button id="devReconcileBtn" class="icon-btn">Force Dev Reconcile</button>
+        </div>
+        <div id="devControlsStatus" class="muted">Development-only tools.</div>
       </div>
 
       <div class="history-area trading-history-panel">
@@ -366,6 +387,15 @@
         <button id="preTradeCancel" class="pretrade-cancel-btn">Cancel</button>
         <button id="preTradeConfirm" class="save-journal-btn" disabled>Confirm &amp; Enter Trade</button>
       </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="brokerOrderModal">
+    <div class="modal-box">
+      <button class="modal-close" id="brokerOrderModalClose">✕</button>
+      <h3>📦 Broker Order Details</h3>
+      <div id="brokerOrderSummary" class="pretrade-subtitle">Order details</div>
+      <pre id="brokerOrderJson" class="broker-order-json">{}</pre>
     </div>
   </div>
 

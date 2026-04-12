@@ -7,6 +7,8 @@ from typing import Any, Dict, Optional
 
 import pytz
 
+from src.brokers.base import BrokerAdapter
+from src.brokers.models import EntryOrderRequest, ExitOrderRequest
 from src.config import Settings
 from src.data.alpaca_client import AlpacaClient
 from src.data.models import DailySummary, PillarEvaluation, RiskProfile, StockCandidate, Trade
@@ -27,11 +29,13 @@ class PaperTradingSimulator:
         event_bus: EventBus,
         db: DatabaseManager,
         alpaca_client: AlpacaClient,
+        broker_adapter: Optional[BrokerAdapter] = None,
     ) -> None:
         self.settings = settings
         self.event_bus = event_bus
         self.db = db
         self.alpaca_client = alpaca_client
+        self.broker_adapter = broker_adapter
 
         self._open_trades: Dict[str, Trade] = {}
         self._daily_pnl: float = 0.0
@@ -238,15 +242,99 @@ class PaperTradingSimulator:
             reference = trade.entry_price
         return self._apply_slippage(float(reference), side="sell")
 
+    @staticmethod
+    def _broker_payload(value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        normalized = value.to_dict() if hasattr(value, "to_dict") else {}
+        if not isinstance(normalized, dict):
+            normalized = {}
+        raw = getattr(value, "raw", None)
+        if isinstance(raw, dict) and raw:
+            merged = dict(raw)
+            aliases = {
+                "id": normalized.get("order_id"),
+                "order_id": normalized.get("order_id"),
+                "client_order_id": normalized.get("client_order_id"),
+                "qty": normalized.get("qty"),
+                "filled_qty": normalized.get("filled_qty"),
+                "status": normalized.get("status"),
+                "type": normalized.get("order_type"),
+                "order_type": normalized.get("order_type"),
+                "order_class": normalized.get("order_class"),
+                "filled_avg_price": normalized.get("filled_avg_price"),
+                "submitted_at": normalized.get("submitted_at"),
+                "updated_at": normalized.get("updated_at"),
+                "filled_at": normalized.get("filled_at"),
+                "stop_loss": normalized.get("stop_loss"),
+                "take_profit": normalized.get("take_profit"),
+                "legs": normalized.get("legs"),
+                "portfolio_value": normalized.get("portfolio_value"),
+                "settled_cash": normalized.get("settled_cash"),
+            }
+            for key, alias_value in aliases.items():
+                if alias_value not in (None, "", [], {}):
+                    merged.setdefault(key, alias_value)
+            return merged
+        return normalized
+
+    @staticmethod
+    def _normalize_order_state(order: Dict[str, Any]) -> str:
+        return str(order.get("status") or order.get("order_status") or "unknown").lower()
+
+    @staticmethod
+    def _order_filled_qty(order: Dict[str, Any]) -> int:
+        return int(float(order.get("filled_qty") or order.get("filled_quantity") or 0) or 0)
+
+    @staticmethod
+    def _order_filled_avg_price(order: Dict[str, Any]) -> float:
+        return float(order.get("filled_avg_price") or order.get("average_fill_price") or 0.0)
+
+    @staticmethod
+    def _order_id(order: Dict[str, Any]) -> Optional[str]:
+        value = order.get("id") or order.get("order_id")
+        return str(value) if value not in (None, "") else None
+
+    @staticmethod
+    def _order_client_order_id(order: Dict[str, Any]) -> Optional[str]:
+        value = order.get("client_order_id") or order.get("client_id")
+        return str(value) if value not in (None, "") else None
+
+    @staticmethod
+    def _position_symbol(position: Dict[str, Any]) -> str:
+        return str(position.get("symbol") or position.get("ticker") or "").upper()
+
+    @staticmethod
+    def _position_qty(position: Dict[str, Any]) -> float:
+        return float(position.get("qty") or position.get("quantity") or 0)
+
+    async def _get_broker_positions_payload(self) -> list[Dict[str, Any]]:
+        if self.broker_adapter:
+            positions = await self.broker_adapter.get_positions()
+            return [self._broker_payload(position) for position in positions]
+        return await self.alpaca_client.get_positions()
+
+    async def _get_broker_account_payload(self) -> Dict[str, Any]:
+        if self.broker_adapter:
+            account = await self.broker_adapter.get_account()
+            return self._broker_payload(account)
+        return await self.alpaca_client.get_account()
+
+    async def _get_broker_order_payload(self, order_id: str, *, nested: bool = False) -> Dict[str, Any]:
+        if self.broker_adapter:
+            order = await self.broker_adapter.get_order(order_id, nested=nested)
+            return self._broker_payload(order)
+        return await self.alpaca_client.get_order(order_id, nested=nested)
+
     async def _reconcile_state(self) -> None:
         self._last_reconciled_at = datetime.now(timezone.utc)
         try:
-            positions = await self.alpaca_client.get_positions()
+            positions = await self._get_broker_positions_payload()
             self._broker_position_symbols = sorted(
                 {
-                    str(position.get("symbol") or "").upper()
+                    self._position_symbol(position)
                     for position in positions
-                    if float(position.get("qty") or 0) != 0
+                    if self._position_symbol(position) and self._position_qty(position) != 0
                 }
             )
         except Exception as exc:
@@ -255,7 +343,7 @@ class PaperTradingSimulator:
             self._broker_position_symbols = []
 
         try:
-            account = await self.alpaca_client.get_account()
+            account = await self._get_broker_account_payload()
             self._last_account_snapshot = {
                 "equity": float(account.get("equity", 0) or 0),
                 "cash": float(account.get("cash", 0) or 0),
@@ -356,6 +444,11 @@ class PaperTradingSimulator:
             estimated_price=estimated_price,
         )
         self._trading_policy.assert_order_allowed(intent)
+        if self.broker_adapter:
+            submission = await self.broker_adapter.submit_market_exit(
+                ExitOrderRequest(symbol=symbol, qty=qty, side=side)
+            )
+            return self._broker_payload(submission.order) if submission.order else dict(submission.raw or {})
         return await self.alpaca_client.submit_market_order(symbol=symbol, qty=qty, side=side)
 
     @staticmethod
@@ -404,6 +497,17 @@ class PaperTradingSimulator:
             estimated_price=estimated_price,
         )
         self._trading_policy.assert_order_allowed(intent)
+        if self.broker_adapter:
+            submission = await self.broker_adapter.submit_market_entry(
+                EntryOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side="buy",
+                    stop_loss=self._normalize_broker_price(stop_loss) or stop_loss if protection_order_class in {"bracket", "oto"} else None,
+                    take_profit=self._normalize_broker_price(take_profit) if protection_order_class == "bracket" else None,
+                )
+            )
+            return self._broker_payload(submission.order) if submission.order else dict(submission.raw or {})
         if protection_order_class in {"bracket", "oto"}:
             return await self.alpaca_client.submit_protected_order(
                 symbol=symbol,
@@ -469,7 +573,7 @@ class PaperTradingSimulator:
         leg_states: list[str] = []
         for leg in legs:
             label = self._protection_leg_label(leg)
-            leg_state = self.alpaca_client.normalize_order_state(leg)
+            leg_state = self._normalize_order_state(leg)
             summaries.append(f"{label}:{leg_state}")
             leg_states.append(leg_state)
             if label == "stop" and leg.get("stop_price") is not None:
@@ -521,12 +625,12 @@ class PaperTradingSimulator:
         await self.db.update_trade(trade)
 
     def _apply_broker_order_to_trade(self, trade: Trade, order: Dict[str, Any]) -> None:
-        trade.alpaca_order_id = str(order.get("id") or trade.alpaca_order_id or "") or None
-        trade.broker_order_state = self.alpaca_client.normalize_order_state(order)
-        trade.broker_client_order_id = str(order.get("client_order_id") or trade.broker_client_order_id or "") or None
-        filled_qty = self.alpaca_client.order_filled_qty(order)
+        trade.alpaca_order_id = self._order_id(order) or trade.alpaca_order_id
+        trade.broker_order_state = self._normalize_order_state(order)
+        trade.broker_client_order_id = self._order_client_order_id(order) or trade.broker_client_order_id
+        filled_qty = self._order_filled_qty(order)
         trade.broker_filled_qty = filled_qty if filled_qty > 0 else None
-        filled_avg_price = self.alpaca_client.order_filled_avg_price(order)
+        filled_avg_price = self._order_filled_avg_price(order)
         trade.broker_filled_avg_price = filled_avg_price if filled_avg_price > 0 else None
         broker_updated_raw = order.get("updated_at") or order.get("filled_at") or order.get("submitted_at")
         if broker_updated_raw:
@@ -598,7 +702,7 @@ class PaperTradingSimulator:
         if not self._use_alpaca_orders or not trade.alpaca_order_id:
             return
         try:
-            order = await self.alpaca_client.get_order(
+            order = await self._get_broker_order_payload(
                 trade.alpaca_order_id,
                 nested=self._trade_expects_broker_native_protection(trade),
             )
@@ -755,7 +859,7 @@ class PaperTradingSimulator:
                 )
                 initial_order = order
                 alpaca_order_id = str(order.get("id") or "") or None
-                broker_state = self.alpaca_client.normalize_order_state(order)
+                broker_state = self._normalize_order_state(order)
                 filled_avg_price = float(order.get("filled_avg_price") or 0.0)
                 if broker_state != "filled":
                     initial_status = "pending_entry"
@@ -1022,6 +1126,73 @@ class PaperTradingSimulator:
         trade = await self._enter_trade(candidate, source="manual_entry")
         if trade is None:
             return {"ok": False, "error": "trade_not_entered"}
+        return {"ok": True, "trade": trade.to_dict()}
+
+    async def inject_synthetic_trade(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        symbol = str(data.get("ticker") or "").strip().upper()
+        if not symbol:
+            return {"ok": False, "error": "ticker_required"}
+        if symbol in self._open_trades:
+            return {"ok": False, "error": "position_already_open"}
+
+        status = str(data.get("status") or "open").strip().lower() or "open"
+        allowed_statuses = {"open", "pending_entry", "pending_exit", "reconciliation_hold", "entry_failed"}
+        if status not in allowed_statuses:
+            return {"ok": False, "error": "invalid_status"}
+
+        entry_price = float(data.get("entry_price") or data.get("price") or 0.0)
+        if entry_price <= 0:
+            return {"ok": False, "error": "invalid_entry_price"}
+
+        quantity = max(1, int(data.get("quantity") or 1))
+        risk_profile = str(data.get("risk_profile") or self._active_profile_name)
+        profile = get_profile(self._profiles, risk_profile)
+        stop_loss = float(data.get("stop_loss") or (entry_price * (1 - profile.stop_loss_pct / 100.0)))
+        take_profit = data.get("take_profit")
+        if take_profit is None and profile.take_profit_pct > 0:
+            take_profit = entry_price * (1 + profile.take_profit_pct / 100.0)
+        trailing_stop_pct = data.get("trailing_stop_pct")
+        if trailing_stop_pct is None and profile.trailing_stop:
+            trailing_stop_pct = profile.trailing_stop_pct
+
+        now = datetime.now(timezone.utc)
+        entry_age_seconds = max(0, int(data.get("entry_age_seconds") or 0))
+        broker_updated_age_seconds = max(0, int(data.get("broker_updated_age_seconds") or 0))
+        entry_time = now - timedelta(seconds=entry_age_seconds)
+        broker_updated_at = (now - timedelta(seconds=broker_updated_age_seconds)) if data.get("broker_order_state") else None
+        trade = Trade(
+            id=None,
+            scanner_hit_id=None,
+            ticker=symbol,
+            side=str(data.get("side") or "buy"),
+            risk_profile=risk_profile,
+            entry_price=entry_price,
+            entry_time=entry_time,
+            exit_price=float(data.get("exit_price")) if data.get("exit_price") is not None else None,
+            exit_time=None,
+            stop_loss=stop_loss,
+            take_profit=float(take_profit) if take_profit is not None else None,
+            trailing_stop_pct=float(trailing_stop_pct) if trailing_stop_pct is not None else None,
+            quantity=quantity,
+            status=status,
+            pnl=None,
+            pnl_percent=None,
+            alpaca_order_id=str(data.get("alpaca_order_id") or "") or None,
+            broker_order_state=str(data.get("broker_order_state") or "") or None,
+            broker_client_order_id=str(data.get("broker_client_order_id") or "") or None,
+            broker_filled_qty=int(data.get("broker_filled_qty")) if data.get("broker_filled_qty") is not None else None,
+            broker_filled_avg_price=float(data.get("broker_filled_avg_price")) if data.get("broker_filled_avg_price") is not None else None,
+            broker_updated_at=broker_updated_at,
+            broker_protection_type=str(data.get("broker_protection_type") or "") or None,
+            broker_protection_status=str(data.get("broker_protection_status") or "") or None,
+            broker_protection_note=str(data.get("broker_protection_note") or "") or None,
+            close_reason=str(data.get("close_reason") or "") or None,
+            max_price_seen=float(data.get("max_price_seen") or entry_price),
+        )
+        trade.id = await self.db.insert_trade(trade)
+        if status in {"open", "pending_entry", "pending_exit", "reconciliation_hold"}:
+            self._open_trades[symbol] = trade
+            await self.event_bus.emit("trade_updated", trade)
         return {"ok": True, "trade": trade.to_dict()}
 
     async def generate_eod_summary(self) -> DailySummary:

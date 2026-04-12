@@ -1,13 +1,2 @@
-services:
-  daytrade-scanner:
-    image: ghcr.io/dax-assistant/daytrade-scanner:latest
-    container_name: daytrade-scanner
-    restart: unless-stopped
-    ports:
-      - "8081:8081"
-    volumes:
-      - ./config/config.yaml:/app/config/config.yaml:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-    labels:
-      com.centurylinklabs.watchtower.enable: "true"
+include:
+  - ../shared/docker-compose.base.yml

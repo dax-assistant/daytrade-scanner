@@ -1,6 +1,6 @@
 environment:
-  name: uat
-  role: preproduction
+  name: dev
+  role: development
 timezone: America/New_York
 TELEGRAM_ENABLED: false
 api:
@@ -14,8 +14,8 @@ api:
       secret_key: ${ALPACA_PAPER_SECRET_KEY}
       trading_base_url: https://paper-api.alpaca.markets
     live:
-      key_id: ${ALPACA_LIVE_KEY_ID}
-      secret_key: ${ALPACA_LIVE_SECRET_KEY}
+      key_id: ""
+      secret_key: ""
       trading_base_url: https://api.alpaca.markets
   finnhub:
     api_key: ${FINNHUB_API_KEY}
@@ -46,17 +46,17 @@ web:
   enabled: true
   host: 0.0.0.0
   port: 8081
-  cors_origins: ['http://localhost:8081']
-  websocket_auth_enabled: true
-  auth: { enabled: true, username: admin, password: ${WEB_AUTH_PASSWORD}, session_secret: ${WEB_AUTH_SESSION_SECRET} }
+  cors_origins: ['*']
+  websocket_auth_enabled: false
+  auth: { enabled: false, username: admin, password: ${WEB_AUTH_PASSWORD}, session_secret: ${WEB_AUTH_SESSION_SECRET} }
 simulator:
   enabled: true
   default_risk_profile: moderate
   account_size: 25000.0
   max_positions: 3
   max_daily_loss: 500.0
-  entry_delay_seconds: 5
-  use_alpaca_orders: true
+  entry_delay_seconds: 1
+  use_alpaca_orders: false
   eod_summary_telegram: false
   weekly_report_telegram: false
   monthly_report_telegram: false
@@ -67,19 +67,12 @@ risk_profiles:
   moderate: { position_size_pct: 5.0, stop_loss_pct: 5.0, take_profit_pct: 10.0, trailing_stop: false, trailing_stop_pct: 0.0, max_hold_minutes: 60 }
   aggressive: { position_size_pct: 10.0, stop_loss_pct: 7.0, take_profit_pct: 0.0, trailing_stop: true, trailing_stop_pct: 5.0, max_hold_minutes: 120 }
 database:
-  path: /app/data/scanner.db
+  path: /app/data/scanner-dev.db
 trading:
   mode: paper
   broker: alpaca
-  paper:
-    enabled: true
   live:
     enabled: false
-    require_web_auth: true
-    require_ws_auth: true
-    require_env_secrets: true
-    require_explicit_confirmation_phrase: true
-    confirmation_phrase: ENABLE LIVE TRADING
     max_notional_per_order: 250.0
     max_position_size_pct: 1.0
 risk:
@@ -88,11 +81,11 @@ risk:
   max_notional_per_order: 250.0
   max_open_positions: 3
   max_daily_loss: 500.0
-  max_trades_per_day: 10
+  max_trades_per_day: 20
   allow_extended_hours: true
   require_manual_approval_for_live_entries: true
 features:
-  enable_trade_injection: false
-  enable_debug_routes: false
+  enable_trade_injection: true
+  enable_debug_routes: true
   enable_manual_entry: true
   enable_emergency_stop: true

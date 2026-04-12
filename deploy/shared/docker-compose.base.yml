@@ -1,0 +1,42 @@
+x-daytrade-scanner-common: &daytrade-scanner-common
+  image: ghcr.io/dax-assistant/daytrade-scanner:${DAYTRADE_SCANNER_IMAGE_TAG:-latest}
+  restart: unless-stopped
+  labels:
+    com.centurylinklabs.watchtower.enable: "true"
+
+services:
+  daytrade-scanner-dev:
+    <<: *daytrade-scanner-common
+    container_name: daytrade-scanner-dev
+    env_file:
+      - ../tower/.env.dev
+    volumes:
+      - /mnt/user/appdata/daytrade-scanner/dev/config/config.yaml:/app/config/config.yaml:ro
+      - /mnt/user/appdata/daytrade-scanner/dev/data:/app/data
+      - /mnt/user/appdata/daytrade-scanner/dev/logs:/app/logs
+    ports:
+      - "8082:8081"
+
+  daytrade-scanner-uat:
+    <<: *daytrade-scanner-common
+    container_name: daytrade-scanner-uat
+    env_file:
+      - ../tower/.env.uat
+    volumes:
+      - /mnt/user/appdata/daytrade-scanner/uat/config/config.yaml:/app/config/config.yaml:ro
+      - /mnt/user/appdata/daytrade-scanner/uat/data:/app/data
+      - /mnt/user/appdata/daytrade-scanner/uat/logs:/app/logs
+    ports:
+      - "8083:8081"
+
+  daytrade-scanner-prod:
+    <<: *daytrade-scanner-common
+    container_name: daytrade-scanner-prod
+    env_file:
+      - ../tower/.env.prod
+    volumes:
+      - /mnt/user/appdata/daytrade-scanner/prod/config/config.yaml:/app/config/config.yaml:ro
+      - /mnt/user/appdata/daytrade-scanner/prod/data:/app/data
+      - /mnt/user/appdata/daytrade-scanner/prod/logs:/app/logs
+    ports:
+      - "8081:8081"

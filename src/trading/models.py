@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,18 @@ class OrderIntent:
     estimated_price: float
     estimated_notional: float
     source: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PolicyDecision:
+    allowed: bool
+    reason_code: str
+    user_message: str
+    audit_details: Dict[str, Any] = field(default_factory=dict)
+    max_notional_allowed: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

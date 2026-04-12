@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pytz
 import yaml
@@ -14,6 +14,80 @@ from src.indicators import compute_overlays, evaluate_entry_signals
 from src.trading.policy import TradingPolicy
 from src.utils import get_primary_window_info, get_session_info
 from src.web.auth import AUTH_COOKIE_NAME, AuthError, get_auth_status, login as auth_login, logout as auth_logout
+
+
+def _broker_payload(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "to_dict"):
+        result = value.to_dict()
+        if isinstance(result, dict):
+            raw = getattr(value, "raw", None)
+            if isinstance(raw, dict) and raw:
+                merged = dict(raw)
+                for key, item in result.items():
+                    if item not in (None, "", [], {}):
+                        merged.setdefault(key, item)
+                return merged
+            return result
+    raw = getattr(value, "raw", None)
+    return raw if isinstance(raw, dict) else {}
+
+
+async def _get_broker_account_snapshot(request: Request) -> dict:
+    broker_adapter = getattr(request.app.state, "broker_adapter", None)
+    alpaca = getattr(request.app.state, "alpaca_client", None)
+    if broker_adapter:
+        return _broker_payload(await broker_adapter.get_account())
+    if alpaca:
+        return await alpaca.get_account()
+    return {}
+
+
+async def _get_broker_positions_snapshot(request: Request) -> list[dict]:
+    broker_adapter = getattr(request.app.state, "broker_adapter", None)
+    alpaca = getattr(request.app.state, "alpaca_client", None)
+    if broker_adapter:
+        positions = await broker_adapter.get_positions()
+        return [_broker_payload(position) for position in positions]
+    if alpaca:
+        return await alpaca.get_positions()
+    return []
+
+
+async def _get_broker_open_orders_snapshot(request: Request) -> list[dict]:
+    broker_adapter = getattr(request.app.state, "broker_adapter", None)
+    alpaca = getattr(request.app.state, "alpaca_client", None)
+    if broker_adapter:
+        orders = await broker_adapter.list_open_orders()
+        return [_broker_payload(order) for order in orders]
+    if alpaca:
+        return await alpaca.list_orders(status="open")
+    return []
+
+
+async def _get_broker_order_snapshot(request: Request, order_id: str) -> dict:
+    broker_adapter = getattr(request.app.state, "broker_adapter", None)
+    alpaca = getattr(request.app.state, "alpaca_client", None)
+    if broker_adapter:
+        order = await broker_adapter.get_order(order_id, nested=True)
+        return _broker_payload(order) if order else {}
+    if alpaca:
+        return await alpaca.get_order(order_id, nested=True)
+    return {}
+
+
+async def _cancel_broker_order(request: Request, order_id: str) -> dict:
+    broker_adapter = getattr(request.app.state, "broker_adapter", None)
+    alpaca = getattr(request.app.state, "alpaca_client", None)
+    if broker_adapter:
+        result = await broker_adapter.cancel_order(order_id)
+        return result.to_dict() if hasattr(result, "to_dict") else _broker_payload(result)
+    if alpaca:
+        status_code = await alpaca.cancel_order(order_id)
+        return {"ok": status_code in {200, 204}, "order_id": order_id, "status_code": status_code}
+    return {"ok": False, "order_id": order_id, "error": "broker_unavailable"}
+
 
 
 def create_routes() -> APIRouter:
@@ -77,6 +151,7 @@ def create_routes() -> APIRouter:
         trading_status = TradingPolicy(settings).get_guard_status()
         return {
             "environment": settings.environment,
+            "environment_role": settings.environment_role,
             "timezone": settings.timezone,
             "web": {
                 "enabled": settings.web.enabled,
@@ -99,6 +174,20 @@ def create_routes() -> APIRouter:
                 "live_enabled": settings.trading.live.enabled,
                 "active_trading_base_url": trading_status.details.get("active_trading_base_url", ""),
             },
+            "risk": {
+                "account_mode": settings.risk.account_mode,
+                "enforce_settled_cash": settings.risk.enforce_settled_cash,
+                "max_notional_per_order": settings.risk.max_notional_per_order,
+                "max_open_positions": settings.risk.max_open_positions,
+                "max_daily_loss": settings.risk.max_daily_loss,
+                "max_trades_per_day": settings.risk.max_trades_per_day,
+            },
+            "features": {
+                "enable_trade_injection": settings.features.enable_trade_injection,
+                "enable_debug_routes": settings.features.enable_debug_routes,
+                "enable_manual_entry": settings.features.enable_manual_entry,
+                "enable_emergency_stop": settings.features.enable_emergency_stop,
+            },
             "notifications": {
                 "telegram_enabled": request.app.state.notification_router.get_settings().get("telegram_enabled", True)
                 if getattr(request.app.state, "notification_router", None)
@@ -116,12 +205,17 @@ def create_routes() -> APIRouter:
     async def trading_status(request: Request) -> dict:
         settings = request.app.state.settings
         status = TradingPolicy(settings).get_guard_status()
+        broker_adapter = getattr(request.app.state, "broker_adapter", None)
+        broker_health = await broker_adapter.healthcheck() if broker_adapter else None
         return {
+            "environment": settings.environment,
+            "environment_role": settings.environment_role,
             "mode": status.mode,
             "broker": status.broker,
             "execution_allowed": status.allowed,
             "guard_reason": status.reason,
             "details": status.details,
+            "broker_health": broker_health.to_dict() if broker_health else None,
         }
 
     @router.post("/api/settings/telegram")
@@ -337,9 +431,12 @@ def create_routes() -> APIRouter:
 
     @router.post("/api/simulator/enter")
     async def manual_enter_trade(request: Request) -> dict:
+        settings = request.app.state.settings
         simulator = request.app.state.simulator
         if not simulator:
             return {"ok": False, "error": "simulator_disabled"}
+        if not settings.features.enable_manual_entry:
+            return {"ok": False, "error": "manual_entry_disabled"}
         body = await request.json()
         result = await simulator.enter_manual_trade(body or {})
         await _audit(
@@ -349,6 +446,39 @@ def create_routes() -> APIRouter:
             details={"ticker": str((body or {}).get("ticker") or "").upper(), "error": result.get("error")},
         )
         return result
+
+    @router.post("/api/dev/inject/trade")
+    async def dev_inject_trade(request: Request) -> dict:
+        settings = request.app.state.settings
+        simulator = request.app.state.simulator
+        if not simulator:
+            return {"ok": False, "error": "simulator_disabled"}
+        if settings.environment_role != "development" or not settings.features.enable_trade_injection:
+            await _audit(request, "dev_trade_injection_requested", status="blocked", details={"reason": "dev_injection_disabled"})
+            return {"ok": False, "error": "dev_injection_disabled"}
+        body = await request.json()
+        result = await simulator.inject_synthetic_trade(body or {})
+        await _audit(
+            request,
+            "dev_trade_injection_requested",
+            status="success" if result.get("ok") else "failure",
+            details={"ticker": str((body or {}).get("ticker") or "").upper(), "error": result.get("error")},
+        )
+        return result
+
+    @router.post("/api/dev/reconcile")
+    async def dev_reconcile(request: Request) -> dict:
+        settings = request.app.state.settings
+        simulator = request.app.state.simulator
+        if not simulator:
+            return {"ok": False, "error": "simulator_disabled"}
+        if settings.environment_role != "development" or not settings.features.enable_debug_routes:
+            await _audit(request, "dev_reconcile_requested", status="blocked", details={"reason": "dev_debug_disabled"})
+            return {"ok": False, "error": "dev_debug_disabled"}
+        await simulator._reconcile_state()
+        status = simulator.get_status()
+        await _audit(request, "dev_reconcile_requested", status="success", details={"issues": status.get("reconciliation_issues", [])})
+        return {"ok": True, "status": status}
 
     @router.get("/api/simulator/positions")
     async def simulator_positions(request: Request) -> dict:
@@ -500,9 +630,12 @@ def create_routes() -> APIRouter:
     @router.post("/api/simulator/emergency-stop")
     async def emergency_stop(request: Request) -> dict:
         """Close all open positions immediately and pause the simulator."""
+        settings = request.app.state.settings
         simulator = request.app.state.simulator
         if not simulator:
             return {"ok": False, "error": "simulator_disabled"}
+        if not settings.features.enable_emergency_stop:
+            return {"ok": False, "error": "emergency_stop_disabled"}
         closed = await simulator.emergency_stop()
         await _audit(request, "simulator_emergency_stop", status="success", details={"closed_trades": len(closed) if isinstance(closed, list) else closed})
         return {"ok": True, "closed_trades": closed, "simulator_paused": True}
@@ -513,19 +646,62 @@ def create_routes() -> APIRouter:
 
     @router.get("/api/account/equity")
     async def account_equity(request: Request) -> dict:
-        alpaca = request.app.state.alpaca_client
-        if not alpaca:
-            return {"equity": 0.0, "cash": 0.0, "buying_power": 0.0, "portfolio_value": 0.0}
         try:
-            account = await alpaca.get_account()
+            account = await _get_broker_account_snapshot(request)
+            if not account:
+                return {"equity": 0.0, "cash": 0.0, "buying_power": 0.0, "portfolio_value": 0.0, "settled_cash": 0.0}
             return {
                 "equity": float(account.get("equity", 0) or 0),
                 "cash": float(account.get("cash", 0) or 0),
                 "buying_power": float(account.get("buying_power", 0) or 0),
-                "portfolio_value": float(account.get("portfolio_value", 0) or 0),
+                "portfolio_value": float(account.get("portfolio_value", account.get("equity", 0)) or 0),
+                "settled_cash": float(account.get("settled_cash", account.get("cash", 0)) or 0),
             }
         except Exception:
-            return {"equity": 0.0, "cash": 0.0, "buying_power": 0.0, "portfolio_value": 0.0}
+            return {"equity": 0.0, "cash": 0.0, "buying_power": 0.0, "portfolio_value": 0.0, "settled_cash": 0.0}
+
+    @router.get("/api/broker/account")
+    async def broker_account(request: Request) -> dict:
+        try:
+            account = await _get_broker_account_snapshot(request)
+            return {"account": account}
+        except Exception as exc:
+            return {"account": {}, "error": str(exc)}
+
+    @router.get("/api/broker/positions")
+    async def broker_positions(request: Request) -> dict:
+        try:
+            positions = await _get_broker_positions_snapshot(request)
+            return {"items": positions}
+        except Exception as exc:
+            return {"items": [], "error": str(exc)}
+
+    @router.get("/api/broker/orders/open")
+    async def broker_open_orders(request: Request) -> dict:
+        try:
+            orders = await _get_broker_open_orders_snapshot(request)
+            return {"items": orders}
+        except Exception as exc:
+            return {"items": [], "error": str(exc)}
+
+    @router.get("/api/broker/orders/{order_id}")
+    async def broker_order_detail(request: Request, order_id: str) -> dict:
+        try:
+            order = await _get_broker_order_snapshot(request, order_id)
+            return {"order": order}
+        except Exception as exc:
+            return {"order": {}, "error": str(exc)}
+
+    @router.post("/api/broker/orders/{order_id}/cancel")
+    async def broker_order_cancel(request: Request, order_id: str) -> dict:
+        result = await _cancel_broker_order(request, order_id)
+        await _audit(
+            request,
+            "broker_order_cancel_requested",
+            status="success" if result.get("ok") else "failure",
+            details={"order_id": order_id, "status_code": result.get("status_code"), "error": result.get("error")},
+        )
+        return result
 
     # ------------------------------------------------------------------ #
     # Custom Watchlist                                                       #

@@ -11,6 +11,7 @@ import pytz
 import uvicorn
 
 from src.alerts import TelegramAlerter
+from src.brokers import build_broker_adapter
 from src.config import load_settings
 from src.data.alpaca_client import AlpacaClient
 from src.data.finnhub_client import FinnhubClient
@@ -35,9 +36,28 @@ def configure_logging(log_level: str) -> None:
     )
 
 
+def validate_runtime_layout(settings) -> None:
+    env = settings.environment.strip().lower()
+    role = settings.environment_role.strip().lower()
+
+    if role == "development" and settings.trading.mode == "live":
+        raise RuntimeError("Development environment cannot run with trading.mode=live")
+    if role == "production" and (settings.features.enable_trade_injection or settings.features.enable_debug_routes):
+        raise RuntimeError("Production environment cannot enable trade injection or debug routes")
+    if role in {"preproduction", "production"} and not settings.web_auth.enabled:
+        raise RuntimeError("Preproduction/production environments require web auth enabled")
+    if env in {"dev", "development"} and role != "development":
+        raise RuntimeError("environment.name dev/development requires environment.role=development")
+    if env == "uat" and role != "preproduction":
+        raise RuntimeError("environment.name uat requires environment.role=preproduction")
+    if env in {"prod", "production", "live"} and role != "production":
+        raise RuntimeError("production-like environment names require environment.role=production")
+
+
 async def _main_async(config_path: Path) -> None:
     settings = load_settings(config_path)
     configure_logging(settings.logging.level)
+    validate_runtime_layout(settings)
 
     trading_policy = TradingPolicy(settings)
     trading_status = trading_policy.get_guard_status()
@@ -58,6 +78,7 @@ async def _main_async(config_path: Path) -> None:
 
     alpaca_client = AlpacaClient(settings)
     finnhub_client = FinnhubClient(settings)
+    broker_adapter = build_broker_adapter(settings, alpaca_client=alpaca_client)
 
     ws_manager = WebSocketManager()
     telegram_alerter = TelegramAlerter(settings)
@@ -84,6 +105,7 @@ async def _main_async(config_path: Path) -> None:
         event_bus=event_bus,
         db=db,
         alpaca_client=alpaca_client,
+        broker_adapter=broker_adapter,
     )
 
     reports = ReportGenerator(db=db, notifier=notification_router, timezone_name=settings.timezone)
@@ -123,6 +145,7 @@ async def _main_async(config_path: Path) -> None:
         scanner=scanner,
         config_path=config_path,
         alpaca_client=alpaca_client,
+        broker_adapter=broker_adapter,
     )
     app.state.notification_router = notification_router
 
