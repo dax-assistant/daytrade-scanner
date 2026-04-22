@@ -478,6 +478,25 @@ class PaperTradingSimulator:
             return None, "broker_native_protection_unavailable"
         return ("bracket" if profile.take_profit_pct > 0 else "oto"), None
 
+    @staticmethod
+    def _is_regular_market_session(now: Optional[datetime] = None) -> bool:
+        eastern = pytz.timezone("America/New_York")
+        current = now.astimezone(eastern) if now is not None else datetime.now(eastern)
+        if current.weekday() >= 5:
+            return False
+        return (current.hour, current.minute) >= (9, 30) and (current.hour, current.minute) < (16, 0)
+
+    def _should_use_broker_native_protection(self) -> bool:
+        return not (self.settings.trading.mode == "paper" and not self._is_regular_market_session())
+
+    def _pending_order_can_continue_waiting(self, trade: Trade) -> bool:
+        if self.settings.trading.mode != "paper":
+            return False
+        state = (trade.broker_order_state or "").lower()
+        if state not in {"accepted", "accepted_for_bidding", "new", "pending_new", "held", "calculated"}:
+            return False
+        return not self._is_regular_market_session()
+
     async def _submit_broker_entry_order(
         self,
         *,
@@ -728,7 +747,9 @@ class PaperTradingSimulator:
                 self._open_trades.pop(trade.ticker, None)
             else:
                 if self._order_age_seconds(trade) >= self._pending_order_stale_seconds:
-                    if is_partial_fill:
+                    if self._pending_order_can_continue_waiting(trade):
+                        await self.db.update_trade(trade)
+                    elif is_partial_fill:
                         await self._quarantine_trade_for_mismatch(trade, "partial_entry_fill_stale")
                         self._append_reconciliation_issue(f"stale_partial_pending_entry:{trade.ticker}")
                     else:
@@ -753,7 +774,9 @@ class PaperTradingSimulator:
                 await self.db.update_trade(trade)
             else:
                 if self._order_age_seconds(trade) >= self._pending_order_stale_seconds:
-                    if is_partial_fill:
+                    if self._pending_order_can_continue_waiting(trade):
+                        await self.db.update_trade(trade)
+                    elif is_partial_fill:
                         trade.exit_price = None
                         trade.exit_time = None
                         await self._quarantine_trade_for_mismatch(trade, "partial_exit_fill_stale")
@@ -836,7 +859,7 @@ class PaperTradingSimulator:
         initial_order: Optional[Dict[str, Any]] = None
         alpaca_order_id: Optional[str] = None
         initial_status = "open"
-        protection_order_class, protection_block_reason = self._broker_protection_request_for_profile(profile)
+        protection_order_class, protection_block_reason = ((self._broker_protection_request_for_profile(profile)) if self._should_use_broker_native_protection() else (None, None))
         if self._use_alpaca_orders and protection_block_reason:
             LOGGER.warning("Execution blocked for %s buy order: %s", candidate.ticker, protection_block_reason)
             self._append_reconciliation_issue(f"execution_blocked:{candidate.ticker}:{protection_block_reason}")

@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from src.brokers.models import BrokerAccount, BrokerOrder, BrokerOrderSubmission, BrokerPosition
@@ -196,6 +197,60 @@ class OrderReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(stored.entry_price, 10.25)
         self.assertIn(("trade_opened", "AAPL", "open"), self.events)
 
+    async def test_paper_premarket_entry_skips_broker_native_protection(self):
+        sim = self.make_sim(
+            submit_orders=[
+                {
+                    "id": "entry-paper-1",
+                    "status": "new",
+                    "filled_qty": "0",
+                    "client_order_id": "entry-paper-1",
+                    "submitted_at": "2026-04-10T13:08:00Z",
+                }
+            ],
+            fetched_orders=[],
+        )
+
+        with patch.object(PaperTradingSimulator, "_is_regular_market_session", return_value=False):
+            trade = await sim._enter_trade(self.make_candidate("BIRD", price=15.5), source="test")
+
+        self.assertEqual(trade.status, "pending_entry")
+        self.assertEqual(trade.alpaca_order_id, "entry-paper-1")
+        self.assertEqual(sim.alpaca_client.market_submissions[0]["symbol"], "BIRD")
+        self.assertEqual(sim.alpaca_client.protected_submissions, [])
+
+    async def test_paper_premarket_pending_entry_waits_past_stale_timeout(self):
+        sim = self.make_sim(
+            submit_orders=[
+                {
+                    "id": "entry-paper-2",
+                    "status": "new",
+                    "filled_qty": "0",
+                    "client_order_id": "entry-paper-2",
+                    "submitted_at": "2026-04-10T13:08:00Z",
+                }
+            ],
+            fetched_orders=[
+                {
+                    "id": "entry-paper-2",
+                    "status": "new",
+                    "filled_qty": "0",
+                    "client_order_id": "entry-paper-2",
+                    "updated_at": "2026-04-10T13:20:00Z",
+                }
+            ],
+        )
+
+        with patch.object(PaperTradingSimulator, "_is_regular_market_session", return_value=False):
+            trade = await sim._enter_trade(self.make_candidate("RMSG", price=2.85), source="test")
+            trade.broker_updated_at = trade.entry_time.replace(year=2025)
+            await sim._reconcile_trade_order(trade)
+
+        stored = await self.db.get_trade_by_id(trade.id)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.status, "pending_entry")
+        self.assertIsNone(stored.close_reason)
+
     async def test_adapter_normalized_order_reconciles_without_alpaca_raw_shape(self):
         broker_adapter = FakeBrokerAdapter(
             submit_orders=[
@@ -283,7 +338,8 @@ class OrderReconciliationTests(unittest.IsolatedAsyncioTestCase):
             fetched_orders=[],
         )
 
-        trade = await sim._enter_trade(self.make_candidate("AAPL"), source="test")
+        with patch.object(PaperTradingSimulator, "_is_regular_market_session", return_value=True):
+            trade = await sim._enter_trade(self.make_candidate("AAPL"), source="test")
 
         self.assertEqual(trade.status, "pending_entry")
         self.assertEqual(len(sim.alpaca_client.protected_submissions), 1)
@@ -347,7 +403,8 @@ class OrderReconciliationTests(unittest.IsolatedAsyncioTestCase):
         sim = self.make_sim(submit_orders=[], fetched_orders=[])
         sim._active_profile_name = "aggressive"
 
-        trade = await sim._enter_trade(self.make_candidate("AMD"), source="test")
+        with patch.object(PaperTradingSimulator, "_is_regular_market_session", return_value=True):
+            trade = await sim._enter_trade(self.make_candidate("AMD"), source="test")
 
         self.assertIsNone(trade)
         self.assertEqual(len(sim.alpaca_client.protected_submissions), 0)
@@ -574,9 +631,10 @@ class OrderReconciliationTests(unittest.IsolatedAsyncioTestCase):
         )
         sim._pending_order_stale_seconds = 1
 
-        trade = await sim._enter_trade(self.make_candidate("AMD"), source="test")
-        trade.broker_updated_at = trade.entry_time.replace(year=2025)
-        await sim._reconcile_trade_order(trade)
+        with patch.object(PaperTradingSimulator, "_is_regular_market_session", return_value=True):
+            trade = await sim._enter_trade(self.make_candidate("AMD"), source="test")
+            trade.broker_updated_at = trade.entry_time.replace(year=2025)
+            await sim._reconcile_trade_order(trade)
 
         stored = await self.db.get_trade_by_id(trade.id)
         self.assertIsNotNone(stored)
