@@ -147,6 +147,7 @@ class SimulatorConfig:
     max_positions: int = 3
     max_daily_loss: float = 500.0
     entry_delay_seconds: int = 5
+    min_pillars_for_entry: int = 1
     use_alpaca_orders: bool = True
     eod_summary_telegram: bool = True
     weekly_report_telegram: bool = True
@@ -368,6 +369,7 @@ def load_settings(config_path: str | Path) -> Settings:
         max_positions=int(simulator_raw.get("max_positions", 3)),
         max_daily_loss=float(simulator_raw.get("max_daily_loss", 500.0)),
         entry_delay_seconds=int(simulator_raw.get("entry_delay_seconds", 5)),
+        min_pillars_for_entry=int(simulator_raw.get("min_pillars_for_entry", 1)),
         use_alpaca_orders=bool(simulator_raw.get("use_alpaca_orders", True)),
         eod_summary_telegram=bool(simulator_raw.get("eod_summary_telegram", True)),
         weekly_report_telegram=bool(simulator_raw.get("weekly_report_telegram", True)),
@@ -534,6 +536,8 @@ def _validate_settings(settings: Settings) -> None:
 
     if settings.trading.mode not in {"paper", "live"}:
         raise ValueError("trading.mode must be 'paper' or 'live'")
+    if not (1 <= settings.simulator.min_pillars_for_entry <= 5):
+        raise ValueError("simulator.min_pillars_for_entry must be between 1 and 5")
     if settings.trading.broker != "alpaca":
         raise ValueError("trading.broker must currently be 'alpaca'")
     if settings.risk.account_mode not in {"cash", "margin"}:

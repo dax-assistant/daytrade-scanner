@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, time, timezone, timedelta
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import pytz
 
@@ -21,6 +21,9 @@ from src.trading.policy import TradingPolicy
 
 LOGGER = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from src.audit import AuditLogger
+
 
 class PaperTradingSimulator:
     def __init__(
@@ -30,12 +33,14 @@ class PaperTradingSimulator:
         db: DatabaseManager,
         alpaca_client: AlpacaClient,
         broker_adapter: Optional[BrokerAdapter] = None,
+        audit_logger: Optional["AuditLogger"] = None,
     ) -> None:
         self.settings = settings
         self.event_bus = event_bus
         self.db = db
         self.alpaca_client = alpaca_client
         self.broker_adapter = broker_adapter
+        self.audit_logger = audit_logger
 
         self._open_trades: Dict[str, Trade] = {}
         self._daily_pnl: float = 0.0
@@ -70,6 +75,21 @@ class PaperTradingSimulator:
         self._last_account_snapshot: Dict[str, float] = {}
         self._symbol_missing_since: Dict[str, datetime] = {}
         self._trading_policy = TradingPolicy(settings)
+
+    async def _audit_trading_action(self, event: str, status: str, details: Dict[str, Any]) -> None:
+        if self.audit_logger is None:
+            return
+        try:
+            await self.audit_logger.log(
+                event,
+                {
+                    "status": status,
+                    "actor": {"type": "simulator", "source": details.get("source")},
+                    "details": details,
+                },
+            )
+        except Exception:
+            LOGGER.exception("Failed to write simulator audit event: %s", event)
 
     async def start(self) -> None:
         if self._running:
@@ -160,7 +180,7 @@ class PaperTradingSimulator:
         if not self._is_active_hours():
             return
 
-        required_pillars = int(self.settings.scanner.thresholds.min_pillars_for_alert)
+        required_pillars = int(self.settings.simulator.min_pillars_for_entry)
         actual_pillars = int(candidate.pillars.score if candidate.pillars else 0)
         if actual_pillars < required_pillars:
             await self.event_bus.emit(
@@ -443,13 +463,24 @@ class PaperTradingSimulator:
             source=source,
             estimated_price=estimated_price,
         )
-        self._trading_policy.assert_order_allowed(intent)
+        await self._audit_trading_action("broker_order_requested", "requested", {"intent": intent.to_dict(), "source": source})
+        try:
+            self._trading_policy.assert_order_allowed(intent)
+        except TradingPolicyError as exc:
+            await self._audit_trading_action("broker_order_rejected", "blocked", {"intent": intent.to_dict(), "source": source, "error": str(exc)})
+            raise
         if self.broker_adapter:
             submission = await self.broker_adapter.submit_market_exit(
                 ExitOrderRequest(symbol=symbol, qty=qty, side=side)
             )
-            return self._broker_payload(submission.order) if submission.order else dict(submission.raw or {})
-        return await self.alpaca_client.submit_market_order(symbol=symbol, qty=qty, side=side)
+            if not submission.accepted:
+                await self._audit_trading_action("broker_order_rejected", "failure", {"intent": intent.to_dict(), "source": source, "error": submission.error, "raw": submission.raw})
+                raise RuntimeError(submission.error or "broker rejected order")
+            payload = self._broker_payload(submission.order) if submission.order else dict(submission.raw or {})
+        else:
+            payload = await self.alpaca_client.submit_market_order(symbol=symbol, qty=qty, side=side)
+        await self._audit_trading_action("broker_order_submitted", "success", {"intent": intent.to_dict(), "source": source, "broker_order_id": self._order_id(payload), "broker_order_state": self._normalize_order_state(payload)})
+        return payload
 
     @staticmethod
     def _trade_expects_broker_native_protection(trade: Trade) -> bool:
@@ -515,7 +546,12 @@ class PaperTradingSimulator:
             source=source,
             estimated_price=estimated_price,
         )
-        self._trading_policy.assert_order_allowed(intent)
+        await self._audit_trading_action("broker_order_requested", "requested", {"intent": intent.to_dict(), "source": source, "protection_order_class": protection_order_class})
+        try:
+            self._trading_policy.assert_order_allowed(intent)
+        except TradingPolicyError as exc:
+            await self._audit_trading_action("broker_order_rejected", "blocked", {"intent": intent.to_dict(), "source": source, "error": str(exc), "protection_order_class": protection_order_class})
+            raise
         if self.broker_adapter:
             submission = await self.broker_adapter.submit_market_entry(
                 EntryOrderRequest(
@@ -526,15 +562,21 @@ class PaperTradingSimulator:
                     take_profit=self._normalize_broker_price(take_profit) if protection_order_class == "bracket" else None,
                 )
             )
-            return self._broker_payload(submission.order) if submission.order else dict(submission.raw or {})
-        if protection_order_class in {"bracket", "oto"}:
-            return await self.alpaca_client.submit_protected_order(
+            if not submission.accepted:
+                await self._audit_trading_action("broker_order_rejected", "failure", {"intent": intent.to_dict(), "source": source, "error": submission.error, "raw": submission.raw, "protection_order_class": protection_order_class})
+                raise RuntimeError(submission.error or "broker rejected order")
+            payload = self._broker_payload(submission.order) if submission.order else dict(submission.raw or {})
+        elif protection_order_class in {"bracket", "oto"}:
+            payload = await self.alpaca_client.submit_protected_order(
                 symbol=symbol,
                 qty=qty,
                 stop_loss=self._normalize_broker_price(stop_loss) or stop_loss,
                 take_profit=self._normalize_broker_price(take_profit) if protection_order_class == "bracket" else None,
             )
-        return await self.alpaca_client.submit_market_order(symbol=symbol, qty=qty, side="buy")
+        else:
+            payload = await self.alpaca_client.submit_market_order(symbol=symbol, qty=qty, side="buy")
+        await self._audit_trading_action("broker_order_submitted", "success", {"intent": intent.to_dict(), "source": source, "broker_order_id": self._order_id(payload), "broker_order_state": self._normalize_order_state(payload), "protection_order_class": protection_order_class})
+        return payload
 
     @staticmethod
     def _normalize_broker_price(value: Optional[float]) -> Optional[float]:
@@ -847,7 +889,10 @@ class PaperTradingSimulator:
             max(float(candidate.price), float(market_reference_price), 0.01),
             side="buy",
         )
-        position_budget = self.get_current_balance() * (profile.position_size_pct / 100.0)
+        position_size_pct = float(profile.position_size_pct)
+        if self.settings.trading.mode == "live":
+            position_size_pct = min(position_size_pct, float(self.settings.trading.live.max_position_size_pct))
+        position_budget = self.get_current_balance() * (position_size_pct / 100.0)
         quantity = int(position_budget / entry_price)
         if quantity < 1:
             return None

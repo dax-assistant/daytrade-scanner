@@ -26,6 +26,7 @@ def create_app(
     config_path: Path | None = None,
     alpaca_client=None,
     broker_adapter=None,
+    audit_logger: AuditLogger | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Day Trade Scanner v3")
 
@@ -44,7 +45,7 @@ def create_app(
     app.state.broker_adapter = broker_adapter
     app.state.ws_auth_tokens = {}
     app.state.http_auth_tokens = {}
-    app.state.audit_logger = AuditLogger(settings)
+    app.state.audit_logger = audit_logger or AuditLogger(settings)
 
     app.add_middleware(
         CORSMiddleware,

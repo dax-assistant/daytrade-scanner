@@ -78,6 +78,17 @@ class TradingPolicy:
 
         max_notional = float(self.settings.risk.max_notional_per_order)
         if status.mode == "live":
+            if (
+                self.settings.risk.require_manual_approval_for_live_entries
+                and intent.side.lower() == "buy"
+                and intent.source != "manual_entry"
+            ):
+                return PolicyDecision(
+                    allowed=False,
+                    reason_code="manual_live_entry_required",
+                    user_message="live buy entries require manual approval",
+                    audit_details={"intent": intent.to_dict(), "guard_status": status.to_dict()},
+                )
             max_notional = min(max_notional, float(self.settings.trading.live.max_notional_per_order))
             if intent.estimated_notional > max_notional:
                 return PolicyDecision(

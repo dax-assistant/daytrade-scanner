@@ -11,6 +11,7 @@ import pytz
 import uvicorn
 
 from src.alerts import TelegramAlerter
+from src.audit import AuditLogger
 from src.brokers import build_broker_adapter
 from src.config import load_settings
 from src.data.alpaca_client import AlpacaClient
@@ -79,6 +80,7 @@ async def _main_async(config_path: Path) -> None:
     alpaca_client = AlpacaClient(settings)
     finnhub_client = FinnhubClient(settings)
     broker_adapter = build_broker_adapter(settings, alpaca_client=alpaca_client)
+    audit_logger = AuditLogger(settings)
 
     ws_manager = WebSocketManager()
     telegram_alerter = TelegramAlerter(settings)
@@ -106,6 +108,7 @@ async def _main_async(config_path: Path) -> None:
         db=db,
         alpaca_client=alpaca_client,
         broker_adapter=broker_adapter,
+        audit_logger=audit_logger,
     )
 
     reports = ReportGenerator(db=db, notifier=notification_router, timezone_name=settings.timezone)
@@ -146,6 +149,7 @@ async def _main_async(config_path: Path) -> None:
         config_path=config_path,
         alpaca_client=alpaca_client,
         broker_adapter=broker_adapter,
+        audit_logger=audit_logger,
     )
     app.state.notification_router = notification_router
 

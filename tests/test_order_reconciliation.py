@@ -859,6 +859,48 @@ class OrderReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored.status, "open")
         self.assertIsNone(stored.close_reason)
 
+    async def test_paper_entry_uses_simulator_entry_threshold_not_alert_threshold(self):
+        sim = self.make_sim(
+            submit_orders=[
+                {
+                    "id": "entry-low-pillar",
+                    "status": "new",
+                    "filled_qty": "0",
+                    "client_order_id": "entry-low-pillar",
+                    "submitted_at": "2026-04-24T13:00:00Z",
+                }
+            ],
+            fetched_orders=[],
+            latest_price=10.0,
+        )
+        sim._entry_delay_seconds = 0
+
+        candidate = self.make_candidate("TRT", price=10.0)
+        candidate.pillars = candidate.pillars or None
+        from src.data.models import PillarEvaluation
+        candidate.pillars = PillarEvaluation(
+            price=True,
+            gap_percent=False,
+            relative_volume=False,
+            float_shares=False,
+            news_catalyst=False,
+        )
+        candidate.entry_signals = {
+            "macd_positive": True,
+            "above_vwap": True,
+            "above_ema9": True,
+            "volume_bullish": True,
+            "all_clear": True,
+        }
+
+        with patch.object(PaperTradingSimulator, "_is_active_hours", return_value=True), patch.object(PaperTradingSimulator, "_is_regular_market_session", return_value=False):
+            await sim.on_scanner_hit(candidate)
+
+        self.assertIn("TRT", sim._open_trades)
+        trade = sim._open_trades["TRT"]
+        self.assertEqual(trade.status, "pending_entry")
+        self.assertEqual(trade.alpaca_order_id, "entry-low-pillar")
+
 
 if __name__ == "__main__":
     unittest.main()

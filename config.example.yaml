@@ -56,6 +56,9 @@ simulator:
   max_positions: 3
   max_daily_loss: 500.0
   entry_delay_seconds: 5
+  # Trade-entry threshold is intentionally separate from alert strictness.
+  # Alerts can require 5 pillars while paper trading can test technical entries sooner.
+  min_pillars_for_entry: 1
   use_alpaca_orders: true
   eod_summary_telegram: false
   weekly_report_telegram: false
