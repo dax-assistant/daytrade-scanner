@@ -448,6 +448,54 @@ class OrderReconciliationTests(unittest.IsolatedAsyncioTestCase):
 
 
 
+
+    async def test_reconciliation_hold_bracket_trade_closes_when_child_stop_leg_filled(self):
+        sim = self.make_sim(
+            submit_orders=[
+                {
+                    "id": "held-bracket-entry-1",
+                    "status": "filled",
+                    "filled_qty": "112",
+                    "filled_avg_price": "12.47",
+                    "client_order_id": "held-bracket-entry-1",
+                    "updated_at": "2026-04-24T13:31:30Z",
+                    "order_class": "bracket",
+                    "legs": [
+                        {"id": "target-1", "type": "limit", "side": "sell", "status": "new", "limit_price": "13.30"},
+                        {"id": "stop-1", "type": "stop", "side": "sell", "status": "held", "stop_price": "11.48"},
+                    ],
+                }
+            ],
+            fetched_orders=[
+                {
+                    "id": "held-bracket-entry-1",
+                    "status": "filled",
+                    "filled_qty": "112",
+                    "filled_avg_price": "12.47",
+                    "client_order_id": "held-bracket-entry-1",
+                    "updated_at": "2026-04-24T20:00:00Z",
+                    "order_class": "bracket",
+                    "legs": [
+                        {"id": "target-1", "type": "limit", "side": "sell", "status": "canceled", "filled_qty": "0", "limit_price": "13.30"},
+                        {"id": "stop-1", "type": "stop", "side": "sell", "status": "filled", "filled_qty": "112", "filled_avg_price": "11.43", "stop_price": "11.48"},
+                    ],
+                }
+            ],
+        )
+
+        trade = await sim._enter_trade(self.make_candidate("TRT", price=12.47), source="test")
+        trade.status = "reconciliation_hold"
+        trade.close_reason = "missing_broker_position"
+        await self.db.update_trade(trade)
+
+        await sim._reconcile_trade_order(trade)
+
+        stored = await self.db.get_trade_by_id(trade.id)
+        self.assertEqual(stored.status, "closed_stop")
+        self.assertEqual(stored.close_reason, "closed_stop")
+        self.assertAlmostEqual(stored.exit_price, 11.43)
+        self.assertAlmostEqual(stored.pnl, (11.43 - stored.entry_price) * stored.quantity)
+
     async def test_reconcile_recovers_stale_entry_failed_that_filled_at_broker(self):
         sim = self.make_sim(
             submit_orders=[],

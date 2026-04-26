@@ -844,9 +844,15 @@ class PaperTradingSimulator:
         await self.db.update_trade(trade)
         await self.event_bus.emit("trade_opened", trade)
 
-    async def _reconcile_held_trade_order(self, trade: Trade) -> None:
+    async def _reconcile_held_trade_order(self, trade: Trade, order: Optional[Dict[str, Any]] = None) -> None:
         reason = trade.close_reason or ""
         state = trade.broker_order_state or "unknown"
+
+        if order is not None:
+            exit_price, exit_reason = self._filled_protection_exit(order)
+            if exit_price is not None and exit_reason is not None:
+                await self._finalize_trade_close(trade, exit_price, exit_reason)
+                return
 
         # Held trades only move when broker state makes the next state explicit.
         if reason == "partial_entry_fill_stale":
@@ -885,7 +891,7 @@ class PaperTradingSimulator:
         is_partial_fill = self._is_partial_fill(trade)
 
         if trade.status == "reconciliation_hold":
-            await self._reconcile_held_trade_order(trade)
+            await self._reconcile_held_trade_order(trade, order)
             return
 
         if trade.status == "pending_entry":
