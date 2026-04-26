@@ -350,17 +350,17 @@ class PaperTradingSimulator:
         self._last_reconciled_at = datetime.now(timezone.utc)
         try:
             positions = await self._get_broker_positions_payload()
-            self._broker_position_symbols = sorted(
-                {
-                    self._position_symbol(position)
-                    for position in positions
-                    if self._position_symbol(position) and self._position_qty(position) != 0
-                }
-            )
+            broker_positions_by_symbol = {
+                self._position_symbol(position): position
+                for position in positions
+                if self._position_symbol(position) and self._position_qty(position) != 0
+            }
+            self._broker_position_symbols = sorted(broker_positions_by_symbol.keys())
         except Exception as exc:
             LOGGER.warning("Failed broker position reconciliation: %s", exc)
             self._append_reconciliation_issue(f"broker_positions_unavailable:{exc}")
             self._broker_position_symbols = []
+            broker_positions_by_symbol = {}
 
         try:
             account = await self._get_broker_account_payload()
@@ -379,9 +379,21 @@ class PaperTradingSimulator:
             if trade.status in {"pending_entry", "pending_exit"}:
                 await self._reconcile_trade_order(trade)
 
-        app_symbols = sorted(symbol for symbol, trade in self._open_trades.items() if trade.status == "open")
+        app_position_statuses = {"open", "pending_exit", "reconciliation_hold"}
+        app_symbols = sorted(
+            symbol for symbol, trade in self._open_trades.items() if trade.status in app_position_statuses
+        )
         missing_in_broker = [symbol for symbol in app_symbols if symbol not in self._broker_position_symbols]
         unexpected_in_broker = [symbol for symbol in self._broker_position_symbols if symbol not in app_symbols]
+
+        if unexpected_in_broker:
+            recovered = await self._recover_unexpected_broker_positions(unexpected_in_broker, broker_positions_by_symbol)
+            if recovered:
+                app_symbols = sorted(
+                    symbol for symbol, trade in self._open_trades.items() if trade.status in app_position_statuses
+                )
+                missing_in_broker = [symbol for symbol in app_symbols if symbol not in self._broker_position_symbols]
+                unexpected_in_broker = [symbol for symbol in self._broker_position_symbols if symbol not in app_symbols]
 
         now = datetime.now(timezone.utc)
         for symbol in missing_in_broker:
@@ -404,6 +416,60 @@ class PaperTradingSimulator:
             self._append_reconciliation_issue(f"missing_in_broker:{','.join(missing_in_broker)}")
         if unexpected_in_broker:
             self._append_reconciliation_issue(f"unexpected_in_broker:{','.join(unexpected_in_broker)}")
+
+
+    async def _recover_unexpected_broker_positions(
+        self,
+        symbols: list[str],
+        positions_by_symbol: Dict[str, Dict[str, Any]],
+    ) -> list[str]:
+        if not symbols:
+            return []
+
+        failed_trades = await self.db.get_trades(status="entry_failed", limit=500)
+        recovered: list[str] = []
+        for symbol in symbols:
+            if symbol in self._open_trades:
+                continue
+            trade = next((candidate for candidate in failed_trades if candidate.ticker.upper() == symbol), None)
+            if not trade:
+                continue
+
+            position = positions_by_symbol.get(symbol, {})
+            if trade.alpaca_order_id:
+                try:
+                    order = await self._get_broker_order_payload(
+                        trade.alpaca_order_id,
+                        nested=self._trade_expects_broker_native_protection(trade),
+                    )
+                    self._apply_broker_order_to_trade(trade, order)
+                except Exception as exc:
+                    self._append_reconciliation_issue(f"broker_order_unavailable:{symbol}:{exc}")
+
+            if self._position_qty(position):
+                trade.quantity = abs(self._position_qty(position))
+            avg_entry = float(position.get("avg_entry_price") or 0) if isinstance(position, dict) else 0.0
+            if avg_entry > 0:
+                trade.entry_price = avg_entry
+                profile = get_profile(self._profiles, trade.risk_profile)
+                if not self._trade_expects_broker_native_protection(trade):
+                    trade.stop_loss = trade.entry_price * (1 - profile.stop_loss_pct / 100.0)
+                    trade.take_profit = (
+                        trade.entry_price * (1 + profile.take_profit_pct / 100.0)
+                        if profile.take_profit_pct > 0
+                        else None
+                    )
+                trade.max_price_seen = max(trade.max_price_seen or trade.entry_price, trade.entry_price)
+
+            trade.status = "open"
+            trade.close_reason = None
+            await self.db.update_trade(trade)
+            self._open_trades[symbol] = trade
+            recovered.append(symbol)
+            self._append_reconciliation_issue(f"recovered_broker_position:{symbol}")
+            await self.event_bus.emit("trade_opened", trade)
+
+        return recovered
 
     def _build_order_intent(
         self,

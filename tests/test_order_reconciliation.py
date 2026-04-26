@@ -447,6 +447,67 @@ class OrderReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("MSFT", sim._open_trades)
 
 
+
+    async def test_reconcile_recovers_stale_entry_failed_that_filled_at_broker(self):
+        sim = self.make_sim(
+            submit_orders=[],
+            fetched_orders=[
+                {
+                    "id": "late-entry-1",
+                    "status": "filled",
+                    "filled_qty": "180",
+                    "filled_avg_price": "7.63",
+                    "client_order_id": "late-entry-1",
+                    "updated_at": "2026-04-24T13:40:00Z",
+                }
+            ],
+            positions=[{"symbol": "PLTD", "qty": "180", "avg_entry_price": "7.633778"}],
+        )
+        trade = await sim.inject_synthetic_trade(
+            {
+                "ticker": "PLTD",
+                "status": "entry_failed",
+                "entry_price": 7.55,
+                "quantity": 180,
+                "alpaca_order_id": "late-entry-1",
+                "broker_order_state": "new",
+                "close_reason": "stale_entry_order",
+            }
+        )
+        trade_id = trade["trade"]["id"]
+
+        await sim._reconcile_state()
+
+        stored = await self.db.get_trade_by_id(trade_id)
+        self.assertEqual(stored.status, "open")
+        self.assertIsNone(stored.close_reason)
+        self.assertEqual(stored.quantity, 180)
+        self.assertAlmostEqual(stored.entry_price, 7.633778)
+        self.assertIn("PLTD", sim._open_trades)
+        self.assertIn(("trade_opened", "PLTD", "open"), self.events)
+
+    async def test_pending_exit_position_is_not_reported_unexpected(self):
+        sim = self.make_sim(
+            submit_orders=[],
+            fetched_orders=[],
+            positions=[{"symbol": "NOK", "qty": "127", "avg_entry_price": "10.85"}],
+        )
+        await sim.inject_synthetic_trade(
+            {
+                "ticker": "NOK",
+                "status": "pending_exit",
+                "entry_price": 10.85,
+                "quantity": 127,
+                "alpaca_order_id": "exit-1",
+                "broker_order_state": "accepted",
+                "close_reason": "closed_time",
+            }
+        )
+
+        await sim._reconcile_state()
+
+        self.assertFalse(any(issue == "unexpected_in_broker:NOK" for issue in sim.get_status()["reconciliation"]["issues"]))
+
     async def test_paper_exit_outside_regular_session_records_local_close_without_queued_broker_order(self):
         sim = self.make_sim(
             submit_orders=[
