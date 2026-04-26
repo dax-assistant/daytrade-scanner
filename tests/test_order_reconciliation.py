@@ -537,6 +537,44 @@ class OrderReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sim.alpaca_client.market_submissions), 1)
         self.assertIn(("trade_closed", "LATE", "closed_time"), self.events)
 
+
+    async def test_paper_exit_outside_regular_session_with_position_queues_broker_exit(self):
+        sim = self.make_sim(
+            submit_orders=[
+                {
+                    "id": "entry-outside-position-1",
+                    "status": "filled",
+                    "filled_qty": "100",
+                    "filled_avg_price": "10.00",
+                    "client_order_id": "entry-outside-position-1",
+                    "updated_at": "2026-04-10T15:00:00Z",
+                },
+                {
+                    "id": "exit-outside-position-1",
+                    "status": "accepted",
+                    "filled_qty": "0",
+                    "client_order_id": "exit-outside-position-1",
+                    "submitted_at": "2026-04-10T20:01:00Z",
+                },
+            ],
+            fetched_orders=[],
+            latest_price=10.5,
+            positions=[{"symbol": "HELD", "qty": "100", "avg_entry_price": "10.00"}],
+        )
+
+        trade = await sim._enter_trade(self.make_candidate("HELD", price=10.0), source="test")
+        self.assertEqual(trade.status, "open")
+
+        with patch.object(PaperTradingSimulator, "_is_regular_market_session", return_value=False):
+            await sim._close_trade(trade, 10.5, "closed_time")
+
+        stored = await self.db.get_trade_by_id(trade.id)
+        self.assertEqual(stored.status, "pending_exit")
+        self.assertEqual(stored.alpaca_order_id, "exit-outside-position-1")
+        self.assertIsNone(stored.exit_price)
+        self.assertEqual(len(sim.alpaca_client.market_submissions), 2)
+        self.assertEqual(sim.alpaca_client.market_submissions[-1]["side"], "sell")
+
     async def test_paper_exit_reject_with_no_broker_position_records_local_close_once(self):
         sim = self.make_sim(
             submit_orders=[

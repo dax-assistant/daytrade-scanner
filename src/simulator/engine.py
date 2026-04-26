@@ -1199,13 +1199,15 @@ class PaperTradingSimulator:
                 and reason in auto_close_reasons
                 and not self._is_regular_market_session()
             ):
-                await self._record_paper_exit_without_broker_fill(
-                    trade,
-                    exit_price,
-                    reason,
-                    f"paper_exit_recorded_outside_regular_session:{trade.ticker}:{reason}",
-                )
-                return
+                has_position = await self._broker_has_position(trade.ticker)
+                if has_position is False:
+                    await self._record_paper_exit_without_broker_fill(
+                        trade,
+                        exit_price,
+                        reason,
+                        f"paper_exit_recorded_outside_regular_session:{trade.ticker}:{reason}",
+                    )
+                    return
 
             try:
                 order = await self._submit_broker_market_order(
