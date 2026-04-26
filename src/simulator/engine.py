@@ -746,6 +746,24 @@ class PaperTradingSimulator:
         filled_qty = int(trade.broker_filled_qty or 0)
         return state in {"partially_filled", "partial_fill"} or (0 < filled_qty < int(trade.quantity))
 
+
+    def _filled_protection_exit(self, order: Dict[str, Any]) -> tuple[Optional[float], Optional[str]]:
+        raw_legs = order.get("legs")
+        legs = [leg for leg in raw_legs if isinstance(leg, dict)] if isinstance(raw_legs, list) else []
+        for leg in legs:
+            if self._normalize_order_state(leg) != "filled":
+                continue
+            label = self._protection_leg_label(leg)
+            price = self._order_filled_avg_price(leg)
+            if price <= 0:
+                candidate = leg.get("stop_price") if label == "stop" else leg.get("limit_price")
+                price = float(candidate or 0)
+            if price <= 0:
+                continue
+            reason = "closed_stop" if label == "stop" else "closed_target" if label == "target" else "closed_broker_protection"
+            return price, reason
+        return None, None
+
     async def _quarantine_trade_for_mismatch(self, trade: Trade, reason: str) -> None:
         trade.status = "reconciliation_hold"
         trade.close_reason = reason
@@ -933,7 +951,11 @@ class PaperTradingSimulator:
             return
 
         if trade.status == "open":
-            await self.db.update_trade(trade)
+            exit_price, exit_reason = self._filled_protection_exit(order)
+            if exit_price is not None and exit_reason is not None:
+                await self._finalize_trade_close(trade, exit_price, exit_reason)
+            else:
+                await self.db.update_trade(trade)
 
     async def reconcile_now(self, trade_id: Optional[int] = None) -> Dict[str, Any]:
         if trade_id is None:
