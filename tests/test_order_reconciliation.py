@@ -26,7 +26,10 @@ class FakeAlpacaClient:
 
     async def submit_market_order(self, symbol: str, qty: int, side: str = "buy"):
         self.market_submissions.append({"symbol": symbol, "qty": qty, "side": side})
-        return self.submit_orders.pop(0)
+        result = self.submit_orders.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     async def submit_protected_order(self, *, symbol: str, qty: int, stop_loss: float, take_profit=None):
         self.protected_submissions.append(
@@ -442,6 +445,67 @@ class OrderReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored.status, "entry_failed")
         self.assertEqual(stored.close_reason, "rejected")
         self.assertNotIn("MSFT", sim._open_trades)
+
+
+    async def test_paper_exit_outside_regular_session_records_local_close_without_queued_broker_order(self):
+        sim = self.make_sim(
+            submit_orders=[
+                {
+                    "id": "entry-outside-1",
+                    "status": "filled",
+                    "filled_qty": "100",
+                    "filled_avg_price": "10.00",
+                    "client_order_id": "entry-outside-1",
+                    "updated_at": "2026-04-10T15:00:00Z",
+                }
+            ],
+            fetched_orders=[],
+            latest_price=10.5,
+        )
+
+        trade = await sim._enter_trade(self.make_candidate("LATE", price=10.0), source="test")
+        self.assertEqual(trade.status, "open")
+
+        with patch.object(PaperTradingSimulator, "_is_regular_market_session", return_value=False):
+            await sim._close_trade(trade, 10.5, "closed_time")
+
+        stored = await self.db.get_trade_by_id(trade.id)
+        self.assertEqual(stored.status, "closed_time")
+        self.assertAlmostEqual(stored.exit_price, 10.5)
+        self.assertAlmostEqual(stored.pnl, (stored.exit_price - stored.entry_price) * stored.quantity)
+        self.assertEqual(len(sim.alpaca_client.market_submissions), 1)
+        self.assertIn(("trade_closed", "LATE", "closed_time"), self.events)
+
+    async def test_paper_exit_reject_with_no_broker_position_records_local_close_once(self):
+        sim = self.make_sim(
+            submit_orders=[
+                {
+                    "id": "entry-reject-1",
+                    "status": "filled",
+                    "filled_qty": "100",
+                    "filled_avg_price": "10.00",
+                    "client_order_id": "entry-reject-1",
+                    "updated_at": "2026-04-10T15:00:00Z",
+                },
+                RuntimeError("403 forbidden"),
+            ],
+            fetched_orders=[],
+            latest_price=9.5,
+            positions=[],
+        )
+
+        trade = await sim._enter_trade(self.make_candidate("MISS", price=10.0), source="test")
+        self.assertEqual(trade.status, "open")
+
+        with patch.object(PaperTradingSimulator, "_is_regular_market_session", return_value=True):
+            await sim._close_trade(trade, 9.5, "closed_stop")
+
+        stored = await self.db.get_trade_by_id(trade.id)
+        self.assertEqual(stored.status, "closed_stop")
+        self.assertAlmostEqual(stored.exit_price, 9.5)
+        self.assertAlmostEqual(stored.pnl, (stored.exit_price - stored.entry_price) * stored.quantity)
+        self.assertEqual(len(sim.alpaca_client.market_submissions), 2)
+        self.assertIn(("trade_closed", "MISS", "closed_stop"), self.events)
 
     async def test_pending_exit_cancel_returns_trade_to_open(self):
         sim = self.make_sim(

@@ -685,6 +685,31 @@ class PaperTradingSimulator:
         trade.close_reason = reason
         await self.db.update_trade(trade)
 
+    async def _broker_has_position(self, symbol: str) -> Optional[bool]:
+        try:
+            positions = await self._get_broker_positions_payload()
+        except Exception as exc:
+            LOGGER.warning("Failed broker position check for %s: %s", symbol, exc)
+            self._append_reconciliation_issue(f"broker_positions_unavailable:{exc}")
+            return None
+
+        normalized = symbol.upper()
+        return any(
+            self._position_symbol(position) == normalized and self._position_qty(position) != 0
+            for position in positions
+        )
+
+    async def _record_paper_exit_without_broker_fill(
+        self,
+        trade: Trade,
+        exit_price: float,
+        reason: str,
+        issue: str,
+    ) -> None:
+        self._append_reconciliation_issue(issue)
+        trade.broker_protection_note = "Paper/sim exit recorded locally because no broker fill is expected for this close path."
+        await self._finalize_trade_close(trade, exit_price, reason)
+
     def _apply_broker_order_to_trade(self, trade: Trade, order: Dict[str, Any]) -> None:
         trade.alpaca_order_id = self._order_id(order) or trade.alpaca_order_id
         trade.broker_order_state = self._normalize_order_state(order)
@@ -817,7 +842,18 @@ class PaperTradingSimulator:
             else:
                 if self._order_age_seconds(trade) >= self._pending_order_stale_seconds:
                     if self._pending_order_can_continue_waiting(trade):
-                        await self.db.update_trade(trade)
+                        has_position = await self._broker_has_position(trade.ticker)
+                        auto_close_reasons = {"closed_time", "closed_eod", "closed_risk"}
+                        if has_position is False and self.settings.trading.mode == "paper" and (trade.close_reason or "") in auto_close_reasons:
+                            exit_price = await self._resolve_exit_market_price(trade)
+                            await self._record_paper_exit_without_broker_fill(
+                                trade,
+                                exit_price,
+                                trade.close_reason or "closed_manual",
+                                f"paper_pending_exit_closed_without_broker_position:{trade.ticker}",
+                            )
+                        else:
+                            await self.db.update_trade(trade)
                     elif is_partial_fill:
                         trade.exit_price = None
                         trade.exit_time = None
@@ -1091,6 +1127,20 @@ class PaperTradingSimulator:
             return
 
         if self._use_alpaca_orders:
+            auto_close_reasons = {"closed_time", "closed_eod", "closed_risk"}
+            if (
+                self.settings.trading.mode == "paper"
+                and reason in auto_close_reasons
+                and not self._is_regular_market_session()
+            ):
+                await self._record_paper_exit_without_broker_fill(
+                    trade,
+                    exit_price,
+                    reason,
+                    f"paper_exit_recorded_outside_regular_session:{trade.ticker}:{reason}",
+                )
+                return
+
             try:
                 order = await self._submit_broker_market_order(
                     symbol=trade.ticker,
@@ -1119,7 +1169,22 @@ class PaperTradingSimulator:
                 return
             except Exception as exc:
                 LOGGER.warning("Failed to submit Alpaca paper sell order for %s: %s", trade.ticker, exc)
+                if self.settings.trading.mode == "paper":
+                    has_position = await self._broker_has_position(trade.ticker)
+                    if has_position is False:
+                        await self._record_paper_exit_without_broker_fill(
+                            trade,
+                            exit_price,
+                            reason,
+                            f"paper_exit_recorded_after_broker_reject:{trade.ticker}:{reason}",
+                        )
+                        return
                 self._append_reconciliation_issue(f"sell_order_failed:{trade.ticker}")
+                trade.exit_price = None
+                trade.exit_time = None
+                trade.broker_protection_note = f"Exit order submission failed; trade held for manual reconciliation: {exc}"
+                await self._quarantine_trade_for_mismatch(trade, "exit_order_failed")
+                await self.event_bus.emit("trade_updated", trade)
                 return
 
         await self._finalize_trade_close(trade, exit_price, reason)
